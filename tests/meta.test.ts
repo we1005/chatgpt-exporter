@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { getMetaVariables, resolveMetaList } from '../src/exporter/meta'
+import { formatFrontMatter, getMetaVariables, resolveMetaList } from '../src/exporter/meta'
 import type { ConversationResult } from '../src/api'
 
 const conversation = {
@@ -55,5 +55,32 @@ describe('resolveMetaList', () => {
 
     it('returns an empty list when metaList is undefined', () => {
         expect(resolveMetaList(undefined, variables)).toEqual([])
+    })
+})
+
+describe('formatFrontMatter', () => {
+    it('writes nothing without metadata', () => {
+        expect(formatFrontMatter([])).toBe('')
+    })
+
+    it('keeps plain values, dates and links as they are', () => {
+        expect(formatFrontMatter([
+            ['title', 'Metadata test'],
+            ['source', 'https://chatgpt.com/c/chat-id'],
+            ['create_time', '2026-01-02T03:04:05.000Z'],
+            ['date', '2026-01-02'],
+            ['tail', 'Q&A, 50% off'],
+            ['empty', ''],
+        ])).toBe('---\ntitle: Metadata test\nsource: https://chatgpt.com/c/chat-id\ncreate_time: 2026-01-02T03:04:05.000Z\ndate: 2026-01-02\ntail: Q&A, 50% off\nempty: \n---\n\n')
+    })
+
+    it('quotes a value that YAML would not read back as the same text', () => {
+        const values = ['Foo: bar', '[Draft] plan', '#1 idea', 'a # b', '- item', 'it\'s: ok', '*bold*', '@home', '!tag', '%x', 'two\nlines', 'ends:', ' padded', 'true', 'Null', '123', '1.5e3']
+        const lines = formatFrontMatter(values.map(value => ['title', value] as const)).split('\n').slice(1, -3)
+        expect(lines).toEqual(values.map(value => `title: ${JSON.stringify(value)}`))
+    })
+
+    it('quotes a name that is not a plain key', () => {
+        expect(formatFrontMatter([['my key', 'a'], ['a: b', 'c'], ['#tag', 'd']])).toBe('---\nmy key: a\n"a: b": c\n"#tag": d\n---\n\n')
     })
 })

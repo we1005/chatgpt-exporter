@@ -150,3 +150,28 @@ body[data-time-format="24"] span[data-time-format="24"] {
     background-color: rgba(0, 0, 0, 0.5);
     animation: ce-pointer-fade-in 0.3s;
 }
+
+/* The format menu of the download button under an answer. The button itself
+   copies the look of the row it sits in. */
+.ce-answer-menu {
+    position: fixed;
+    z-index: 999;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 8px;
+    color: var(--ce-text-primary);
+    background-color: var(--ce-menu-surface);
+    border-radius: 1rem;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.12), 0 2px 8px rgba(0, 0, 0, 0.08);
+    animation: ce-fade-in 0.15s;
+}
+
+:is(.dark, [data-theme="dark"]) .ce-answer-menu {
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4), 0 2px 8px rgba(0, 0, 0, 0.3);
+}
+
+.ce-answer-menu .ce-menu-item {
+    column-gap: 8px;
+    padding-inline: 8px;
+}

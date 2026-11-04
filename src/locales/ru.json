@@ -1,5 +1,5 @@
 {
-  "title": "ChatGPT Exporter",
+  "title": "Super ChatGPT Exporter",
   "ExportHelper": "Export",
   "Setting": "Параметры",
   "Language": "Язык",
@@ -69,5 +69,9 @@
   "Export Skipped Message": "{{n}} разговоров не удалось загрузить после нескольких попыток, они отсутствуют в экспорте:",
   "List Rate Limited Wait": "Слишком много запросов к API · подождите {{n}} с и попробуйте снова",
   "List Rate Limited": "Слишком много запросов к API · попробуйте чуть позже",
-  "List Load Failed": "Не удалось загрузить беседы"
+  "List Load Failed": "Не удалось загрузить беседы",
+  "Thought for {{seconds}} seconds": "Размышления: {{seconds}} с",
+  "Thinking": "Размышление",
+  "Download answer": "Скачать этот ответ",
+  "The answer could not be found": "Ответ не найден"
 }

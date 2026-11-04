@@ -1,28 +1,32 @@
 import JSZip from 'jszip'
-import { fetchConversation, getCurrentChatId, getFileAttachmentNames, processConversation, shouldSkipMessageInExport, withImageAssets } from '../api'
+import { fetchConversation, getCurrentChatId, getFileAttachmentNames, processConversation, selectAnswer, shouldSkipMessageInExport, withImageAssets } from '../api'
 import { KEY_SOURCES_ENABLED, KEY_THINKING_ENABLED, KEY_TIMESTAMP_24H, KEY_TIMESTAMP_ENABLED, KEY_TIMESTAMP_MARKDOWN, baseUrl } from '../constants'
 import i18n from '../i18n'
 import { checkIfConversationStarted } from '../page'
 import { checkIfTemporaryChatIsExportable } from '../temporaryChat'
-import { transformContentReferences } from '../utils/citations'
+import { escapeMarkdownText, replaceMarkers, transformContentReferences } from '../utils/citations'
 import { buildZipFileName, downloadFile, getFileNameWithFormat } from '../utils/download'
 import { addImageFilesToZip, extractImageFiles, getImageMode } from '../utils/imageFiles'
 import { protectMath } from '../utils/latex'
-import { fromMarkdown, toMarkdown } from '../utils/markdown'
+import { codeFence, fromMarkdown, isLocalImageSrc, plainTextToMarkdown, toMarkdown } from '../utils/markdown'
 import { ScriptStorage } from '../utils/storage'
-import { standardizeLineBreaks } from '../utils/text'
+import { decodeTypedLineBreaks, standardizeLineBreaks } from '../utils/text'
 import { transformAuthor } from '../utils/author'
-import type { ApiConversation, ApiConversationWithId, Citation, ConversationNodeMessage, ConversationResult, ThinkingContent } from '../api'
+import type { ApiConversation, ApiConversationWithId, ConversationNodeMessage, ConversationResult, ThinkingContent } from '../api'
 import type { ExportMeta, ImageMode } from '../ui/SettingContext'
 import type { PartInfo } from '../utils/download'
-import { getMetaVariables, resolveMetaList } from './meta'
+import { formatFrontMatter, getMetaVariables, resolveMetaList } from './meta'
 
 /** Omitted images skip the download, the other modes need the image data */
 function loadImages<T extends ApiConversation>(conversation: T, imageMode: ImageMode): Promise<T> {
     return imageMode === 'omit' ? Promise.resolve(conversation) : withImageAssets(conversation)
 }
 
-export async function exportToMarkdown(fileNameFormat: string, metaList: ExportMeta[]) {
+/**
+ * `answerIds` limits the export to one answer of the conversation, the ids
+ * are those of the message blocks the page shows for it.
+ */
+export async function exportToMarkdown(fileNameFormat: string, metaList: ExportMeta[], answerIds?: string[]) {
     if (!checkIfConversationStarted()) {
         alert(i18n.t('Please start a conversation first'))
         return false
@@ -39,10 +43,17 @@ export async function exportToMarkdown(fileNameFormat: string, metaList: ExportM
     let rawConversation = await loadImages(await fetchConversation(chatId), imageMode)
     if (imageMode === 'files') rawConversation = await extractImageFiles(rawConversation, assets)
     const enableThinking = ScriptStorage.get<boolean>(KEY_THINKING_ENABLED) ?? false
-    const conversation = processConversation(rawConversation, { enableThinking })
-    const markdown = standardizeLineBreaks(conversationToMarkdown(conversation, metaList, imageMode))
+    const processed = processConversation(rawConversation, { enableThinking })
+    const answer = answerIds && selectAnswer(processed, answerIds)
+    if (answer && answer.conversationNodes.length === 0) {
+        alert(i18n.t('The answer could not be found'))
+        return false
+    }
+    const conversation = answer ?? processed
+    const markdown = standardizeLineBreaks(conversationToMarkdown(conversation, metaList, imageMode, !!answer))
 
-    const fileName = getFileNameWithFormat(fileNameFormat, 'md', { title: conversation.title, chatId, createTime: conversation.createTime, updateTime: conversation.updateTime })
+    const title = answer ? `${conversation.title}-answer-${answer.answerIndex}` : conversation.title
+    const fileName = getFileNameWithFormat(fileNameFormat, 'md', { title, chatId, createTime: conversation.createTime, updateTime: conversation.updateTime })
     // A conversation without images stays a plain Markdown file
     if (assets.size === 0) {
         downloadFile(fileName, 'text/markdown', markdown)
@@ -83,7 +94,7 @@ export async function exportAllToMarkdown(fileNameFormat: string, apiConversatio
         else {
             filenameMap.set(fileName, 1)
         }
-        const content = conversationToMarkdown(conversation, metaList, imageMode)
+        const content = standardizeLineBreaks(conversationToMarkdown(conversation, metaList, imageMode))
         zip.file(fileName, content)
     })
     addImageFilesToZip(zip, assets)
@@ -107,24 +118,31 @@ function generateZip(zip: JSZip) {
     })
 }
 
-function conversationToMarkdown(conversation: ConversationResult, metaList: ExportMeta[] | undefined, imageMode: ImageMode) {
+/** Answers keep their own headings, so they sit below the role headings of the export. */
+const ASSISTANT_HEADING_OFFSET = 2
+
+/**
+ * `answerOnly` is for one answer taken out of its conversation. It is the
+ * markdown of the answer itself, without the title and the role headings.
+ */
+function conversationToMarkdown(conversation: ConversationResult, metaList: ExportMeta[] | undefined, imageMode: ImageMode, answerOnly = false) {
     const { id, title, conversationNodes } = conversation
     const source = `${baseUrl}/c/${id}`
 
-    const _metaList = resolveMetaList(metaList, getMetaVariables(conversation, source))
-        .map(([name, val]) => `${name}: ${val}`)
-    const frontMatter = _metaList.length > 0
-        ? `---\n${_metaList.join('\n')}\n---\n\n`
-        : ''
+    const frontMatter = formatFrontMatter(resolveMetaList(metaList, getMetaVariables(conversation, source)))
 
     const enableTimestamp = ScriptStorage.get<boolean>(KEY_TIMESTAMP_ENABLED) ?? false
     const timeStampMarkdown = ScriptStorage.get<boolean>(KEY_TIMESTAMP_MARKDOWN) ?? false
     const timeStamp24H = ScriptStorage.get<boolean>(KEY_TIMESTAMP_24H) ?? false
     const enableSources = ScriptStorage.get<boolean>(KEY_SOURCES_ENABLED) ?? true
-    // Same placeholder as the text export
+    // Same placeholder as the text export. Images are embedded or saved as
+    // files, one that ChatGPT loads from a URL is left out.
     const renderImage = imageMode === 'omit'
         ? () => '[image]'
-        : (src: string) => `![image](${src})`
+        : (src: string) => isLocalImageSrc(src) ? `![image](${src})` : ''
+    // Numbered once for the whole document, every message cites from 1
+    const footnotes = { next: 1 }
+    const headingOffset = answerOnly ? 0 : ASSISTANT_HEADING_OFFSET
 
     const content = conversationNodes.map(({ message, thinking }) => {
         if (!message || !message.content) return null
@@ -144,33 +162,49 @@ function conversationToMarkdown(conversation: ConversationResult, metaList: Expo
         const author = transformAuthor(message.author)
         const thinkingBlock = thinking ? formatThinkingMarkdown(thinking) : ''
 
+        const isAssistant = message.author.role === 'assistant'
         const postSteps: Array<(input: string) => string> = []
-        if (message.author.role === 'assistant') {
+        if (isAssistant) {
             // Handle new-style content references (web search citations with Unicode markers)
             postSteps.push(input => transformContentReferences(input, message.metadata, {
                 includeSourceList: enableSources,
                 sourceListLabel: i18n.t('Sources'),
+                includeImages: false,
+                // The pages come as a list after the answer, not as links inside its sentences
+                includeCitations: false,
             }))
             // Handle old-style footnotes (【11†(PrintWiki)】 format)
-            postSteps.push(input => transformFootNotes(input, message.metadata))
-        }
-        // Only message from assistant will be reformatted
-        if (message.author.role === 'assistant') {
+            postSteps.push(input => transformFootNotes(input, message.metadata, footnotes))
+            // Only message from assistant will be reformatted
             postSteps.push((input) => {
                 // Keep formulas out of the markdown round trip, which would escape them
                 const { text, restore } = protectMath(input)
-                return restore(toMarkdown(fromMarkdown(text), text))
+                return restore(toMarkdown(fromMarkdown(text), text, { headingOffset, dropRemoteImages: true }))
             })
         }
         const postProcess = (input: string) => postSteps.reduce((acc, fn) => fn(acc), input)
-        const content = transformContent(message.content, message.metadata, postProcess, renderImage)
+        // The text of a user is markdown when ChatGPT stored it as markdown, a line break is
+        // a backslash then. Any other text is plain text, ChatGPT shows it as typed.
+        const isMarkdownText = message.metadata?.serialization_metadata?.render_format === 'markdown'
+        const markdownText = (input: string) => {
+            // The positions of the tree are those of the text it was read from
+            const typedText = decodeTypedLineBreaks(input)
+            return toMarkdown(fromMarkdown(typedText), typedText, { headingOffset, dropRemoteImages: true })
+        }
+        const prose = isAssistant ? postProcess : isMarkdownText ? markdownText : plainTextToMarkdown
+        const block = isAssistant ? postProcess : (input: string) => input
+        const content = transformContent(message.content, message.metadata, prose, block, renderImage)
         const attachments = getFileAttachmentNames(message).map(name => `- 📎 ${name}`).join('\n')
         const attachmentsBlock = attachments ? `\n\n${attachments}` : ''
 
-        return `#### ${author}:\n${timestampHtml}${thinkingBlock}${content}${attachmentsBlock}`
+        // A message of images that are left out has nothing to show
+        if (!content.trim() && !attachments && !thinkingBlock) return null
+
+        const heading = answerOnly ? '' : `## ${author}:\n`
+        return `${heading}${timestampHtml}${thinkingBlock}${content}${attachmentsBlock}`
     }).filter(Boolean).join('\n\n')
 
-    const markdown = `${frontMatter}# ${title}\n\n${content}`
+    const markdown = answerOnly ? `${frontMatter}${content.trimEnd()}\n` : `${frontMatter}# ${title.replace(/\s+/g, ' ').trim()}\n\n${content}`
 
     return markdown
 }
@@ -181,95 +215,110 @@ function conversationToMarkdown(conversation: ConversationResult, metaList: Expo
 function transformFootNotes(
     input: string,
     metadata: ConversationNodeMessage['metadata'],
+    footnotes: { next: number },
 ) {
     // 【11†(PrintWiki)】
     const footNoteMarkRegex = /【(\d+)†\((.+?)\)】/g
 
-    const citationList: Citation[] = []
+    // A message cites from 1, the document numbers its notes once. A note is
+    // defined once per message, however often it is cited.
+    const numbers = new Map<number, number>()
+    const definitions: string[] = []
     const output = input.replace(footNoteMarkRegex, (match, citeIndex, _evidenceText) => {
         const citation = metadata?.citations?.find(cite => cite.metadata?.extra?.cited_message_idx === +citeIndex)
-        if (citation) {
-            citationList.push(citation)
-            // Use markdown caret to represent foot note ([^1])
-            return `[^${citeIndex}]`
+        if (!citation) return match
+
+        let number = numbers.get(+citeIndex)
+        if (number == null) {
+            number = footnotes.next++
+            numbers.set(+citeIndex, number)
+            const citeTitle = citation.metadata?.title ?? 'No title'
+            const url = citation.metadata?.url
+            definitions.push(`[^${number}]: ${url ? `[${escapeMarkdownText(citeTitle)}](<${url}>)` : citeTitle}`)
         }
 
-        return match
+        // Use markdown caret to represent foot note ([^1])
+        return `[^${number}]`
     })
 
-    const citationText = citationList.map((citation) => {
-        const citeIndex = citation.metadata?.extra?.cited_message_idx ?? 1
-        const citeTitle = citation.metadata?.title ?? 'No title'
-        return `[^${citeIndex}]: ${citeTitle}`
-    }).join('\n')
-
     // Foot notes are placed at the end of the conversation node, not the end of the whole document
-    return `${output}\n\n${citationText}`
+    return definitions.length > 0 ? `${output}\n\n${definitions.join('\n')}` : output
+}
+
+/** Every line of the text, in a quote. */
+function quote(text: string) {
+    return text.split('\n').map(line => `> ${line}`).join('\n')
 }
 
 /**
- * Convert the content based on the type of message
+ * Convert the content based on the type of message.
+ * `prose` reads text as the message's author wrote it, `block` is for the
+ * markdown this exporter writes itself.
  */
 function transformContent(
     content: ConversationNodeMessage['content'],
     metadata: ConversationNodeMessage['metadata'],
-    postProcess: (input: string) => string,
+    prose: (input: string) => string,
+    block: (input: string) => string,
     renderImage: (src: string) => string,
 ) {
     switch (content.content_type) {
         case 'text':
-            return postProcess(content.parts?.join('\n') || '')
+            return prose(content.parts?.join('\n') || '')
         case 'code':
-            return postProcess(`Code:\n\`\`\`\n${content.text}\n\`\`\``)
+            return block(`Code:\n${codeFence(content.text)}`)
         case 'execution_output':
             if (metadata?.aggregate_result?.messages) {
                 return metadata.aggregate_result.messages
                     .filter(msg => msg.message_type === 'image')
                     .map(msg => renderImage(msg.image_url))
-                    .join('\n')
+                    .filter(Boolean)
+                    .join('\n\n')
             }
-            return postProcess(`Result:\n\`\`\`\n${content.text}\n\`\`\`` || '')
+            return block(`Result:\n${codeFence(content.text ?? '')}`)
         case 'tether_quote':
-            return postProcess(`> ${content.title || content.text || ''}`)
+            return block(quote(content.title || content.text || ''))
         case 'tether_browsing_code':
-            return postProcess('') // TODO: implement
+            return block('') // TODO: implement
         case 'tether_browsing_display': {
             const metadataList = metadata?._cite_metadata?.metadata_list
             if (Array.isArray(metadataList) && metadataList.length > 0) {
-                return postProcess(metadataList.map(({ title, url }) => `> [${title}](${url})`).join('\n'))
+                return block(metadataList.map(({ title, url }) => `> [${escapeMarkdownText(title)}](<${url}>)`).join('\n'))
             }
-            return postProcess('')
+            return block('')
         }
         case 'multimodal_text': {
+            // Parts are paragraphs, a text and an image must not run together
             return content.parts?.map((part) => {
-                if (typeof part === 'string') return postProcess(part)
+                if (typeof part === 'string') return prose(part)
                 if (part.content_type === 'image_asset_pointer') return renderImage(part.asset_pointer)
-                if (part.content_type === 'audio_transcription') return `[audio] ${part.text}`
+                if (part.content_type === 'audio_transcription') return `[audio] ${plainTextToMarkdown(part.text)}`
                 if (part.content_type === 'audio_asset_pointer') return null
                 if (part.content_type === 'real_time_user_audio_video_asset_pointer') return null
-                return postProcess('[Unsupported multimodal content]')
-            }).join('\n') || ''
+                return block('[Unsupported multimodal content]')
+            }).filter(Boolean).join('\n\n') || ''
         }
         default:
             console.warn('[Exporter] Unsupported Content:', content.content_type, content)
-            return postProcess(`[Unsupported Content: ${content.content_type}]`)
+            return block(`[Unsupported Content: ${content.content_type}]`)
     }
 }
 
 function formatThinkingMarkdown(thinking: ThinkingContent): string {
     const durationLabel = thinking.durationSeconds != null
-        ? `Thought for ${thinking.durationSeconds} seconds`
-        : 'Thinking'
+        ? i18n.t('Thought for {{seconds}} seconds', { seconds: thinking.durationSeconds })
+        : i18n.t('Thinking')
 
     const parts: string[] = []
 
     if (thinking.activities?.length) {
-        parts.push(thinking.activities.map(a => `- ${a}`).join('\n'))
+        parts.push(thinking.activities.map(a => `- ${replaceMarkers(a, 'markdown')}`).join('\n'))
     }
 
     const thoughts = thinking.thoughts
         .map(t => t.content || t.summary)
         .filter(Boolean)
+        .map(text => replaceMarkers(text, 'markdown'))
         .join('\n\n')
     if (thoughts) parts.push(thoughts)
 

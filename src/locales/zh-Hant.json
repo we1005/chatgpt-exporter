@@ -1,5 +1,5 @@
 {
-  "title": "ChatGPT Exporter",
+  "title": "Super ChatGPT Exporter",
   "ExportHelper": "Export",
   "Setting": "設定",
   "Language": "語言",
@@ -69,5 +69,9 @@
   "Export Skipped Message": "有 {{n}} 個對話重試多次仍失敗，沒有包含在匯出檔中：",
   "List Rate Limited Wait": "請求太頻繁 · 請等 {{n}} 秒後再試",
   "List Rate Limited": "請求太頻繁 · 請稍後再試",
-  "List Load Failed": "無法載入對話"
+  "List Load Failed": "無法載入對話",
+  "Thought for {{seconds}} seconds": "思考了 {{seconds}} 秒",
+  "Thinking": "思考中",
+  "Download answer": "下載此回答",
+  "The answer could not be found": "找不到這則回答"
 }

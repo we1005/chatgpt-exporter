@@ -1,8 +1,10 @@
 import { render } from 'preact'
 import sentinel from 'sentinel-js'
 import { fetchConversation } from './api'
+import { ANSWER_ACTIONS_SELECTOR, getAnswerMessageIds, getLastActionButton, readButtonLook } from './answerActions'
 import { getChatIdFromUrl, isSharePage } from './page'
 import { watchTemporaryChatId } from './temporaryChat'
+import { AnswerExport } from './ui/AnswerExport'
 import { Menu } from './ui/Menu'
 import { onloadSafe } from './utils/utils'
 
@@ -77,6 +79,8 @@ function main() {
         syncNavMenu()
         setInterval(syncNavMenu, 1000)
 
+        watchAnswerActions()
+
         // Support for share page. Added 2024-09-07.
         if (isSharePage()) {
             sentinel.on(`div[role="presentation"] > .w-full > div >.flex.w-full`, (target) => {
@@ -86,6 +90,50 @@ function main() {
 
         watchMessageTimestamps()
     })
+}
+
+/**
+ * A download button at the end of the action row under each answer, which
+ * saves that answer alone.
+ */
+function watchAnswerActions() {
+    // Action row to the element that holds its button
+    const hosts = new Map<Element, HTMLElement>()
+
+    const mount = (row: Element) => {
+        const last = getLastActionButton(row)
+        if (!last) return
+
+        // The button has no box of its own, the row lays it out next to the others
+        const host = document.createElement('span')
+        host.className = 'ce-answer-export'
+        host.style.display = 'contents'
+        render(<AnswerExport look={readButtonLook(last)} getMessageIds={() => getAnswerMessageIds(row)} />, host)
+        last.after(host)
+        hosts.set(row, host)
+    }
+
+    const sync = () => {
+        const rows = new Set(Array.from(document.querySelectorAll(ANSWER_ACTIONS_SELECTOR)).filter(row => getAnswerMessageIds(row).length > 0))
+
+        hosts.forEach((host, row) => {
+            if (rows.has(row)) {
+                // The page can re-render a row and drop the button
+                if (!host.isConnected) getLastActionButton(row)?.after(host)
+                return
+            }
+            render(null, host)
+            host.remove()
+            hosts.delete(row)
+        })
+        rows.forEach((row) => {
+            if (!hosts.has(row)) mount(row)
+        })
+    }
+
+    sentinel.on(ANSWER_ACTIONS_SELECTOR, sync)
+    sync()
+    setInterval(sync, 1000)
 }
 
 /**

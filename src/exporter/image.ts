@@ -100,7 +100,7 @@ function inlineBlobImages(live: HTMLElement, snapshot: HTMLElement) {
             target.src = dataUrl
         }
         catch (error) {
-            console.warn('[ChatGPT Exporter:screenshot] failed to copy image', error)
+            console.warn('[Super ChatGPT Exporter:screenshot] failed to copy image', error)
         }
     })
 }
@@ -445,7 +445,7 @@ async function prepareRedesignedThread(threadEl: HTMLElement, effect: Effect, is
         await sleep(500)
     }
     if (threadEl.querySelector(HISTORY_SPINNER_SELECTOR)) {
-        console.warn('[ChatGPT Exporter:screenshot] history is still loading; exporting the loaded part')
+        console.warn('[Super ChatGPT Exporter:screenshot] history is still loading; exporting the loaded part')
     }
 
     // Walk down and clone each turn while it is mounted. Mounted turns form
@@ -869,11 +869,11 @@ async function renderPng(screenshotEl: HTMLElement, effect: Effect, backgroundCo
 
     const takeTiledScreenshot = async (): Promise<Blob | null> => {
         if (!capture) {
-            console.warn('[ChatGPT Exporter:screenshot] tiled capture unavailable')
+            console.warn('[Super ChatGPT Exporter:screenshot] tiled capture unavailable')
             return null
         }
         if (typeof CompressionStream === 'undefined') {
-            console.warn('[ChatGPT Exporter:screenshot] CompressionStream unavailable; using downscaled fallback')
+            console.warn('[Super ChatGPT Exporter:screenshot] CompressionStream unavailable; using downscaled fallback')
             return null
         }
 
@@ -949,7 +949,7 @@ async function renderPng(screenshotEl: HTMLElement, effect: Effect, backgroundCo
         }
 
         // eslint-disable-next-line no-console
-        console.log(`ChatGPT Exporter:takeScreenshot with height=${height} width=${width} targetHeight=${targetHeight} targetWidth=${targetWidth}`)
+        console.log(`Super ChatGPT Exporter:takeScreenshot with height=${height} width=${width} targetHeight=${targetHeight} targetWidth=${targetWidth}`)
 
         /**
          * A browser may return an empty canvas instead of throwing when a
@@ -968,7 +968,7 @@ async function renderPng(screenshotEl: HTMLElement, effect: Effect, backgroundCo
         || desiredWidth * desiredHeight > MAX_SCREENSHOT_DIMENSION * MAX_SCREENSHOT_DIMENSION
     let png = shouldTile ? await takeTiledScreenshot() : await takeDownscaledScreenshot()
     if (!png && shouldTile) {
-        console.warn('[ChatGPT Exporter:screenshot] tiled export failed; using downscaled fallback')
+        console.warn('[Super ChatGPT Exporter:screenshot] tiled export failed; using downscaled fallback')
         png = await takeDownscaledScreenshot()
     }
     return png

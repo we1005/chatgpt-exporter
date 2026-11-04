@@ -1,16 +1,16 @@
 import JSZip from 'jszip'
-import { fetchConversation, getCurrentChatId, getFileAttachmentNames, processConversation, shouldSkipMessageInExport, withImageAssets } from '../api'
+import { fetchConversation, getCurrentChatId, getFileAttachmentNames, processConversation, selectAnswer, shouldSkipMessageInExport, withImageAssets } from '../api'
 import { KEY_SOURCES_ENABLED, KEY_THINKING_ENABLED, KEY_TIMESTAMP_24H, KEY_TIMESTAMP_ENABLED, KEY_TIMESTAMP_HTML, baseUrl } from '../constants'
 import i18n from '../i18n'
 import { checkIfConversationStarted, getUserAvatar } from '../page'
 import templateHtml from '../template.html?raw'
 import { checkIfTemporaryChatIsExportable } from '../temporaryChat'
-import { transformContentReferences } from '../utils/citations'
+import { replaceMarkers, transformContentReferences } from '../utils/citations'
 import { buildZipFileName, downloadFile, getFileNameWithFormat } from '../utils/download'
 import { protectMath, toBracketDelimiters } from '../utils/latex'
 import { toHtml } from '../utils/markdown'
 import { ScriptStorage } from '../utils/storage'
-import { standardizeLineBreaks } from '../utils/text'
+import { decodeTypedLineBreaks, standardizeLineBreaks } from '../utils/text'
 import { dateStr, getColorScheme } from '../utils/utils'
 import { transformAuthor } from '../utils/author'
 import type { ApiConversationWithId, ConversationNodeMessage, ConversationResult, ThinkingContent } from '../api'
@@ -19,7 +19,8 @@ import type { PartInfo } from '../utils/download'
 import { escapeHtml, fillTemplate, metaDetailsHtml } from './htmlTemplate'
 import { getMetaVariables, resolveMetaList } from './meta'
 
-export async function exportToHtml(fileNameFormat: string, metaList: ExportMeta[]) {
+/** `answerIds` limits the export to one answer, see `exportToMarkdown` */
+export async function exportToHtml(fileNameFormat: string, metaList: ExportMeta[], answerIds?: string[]) {
     if (!checkIfConversationStarted()) {
         alert(i18n.t('Please start a conversation first'))
         return false
@@ -35,10 +36,17 @@ export async function exportToHtml(fileNameFormat: string, metaList: ExportMeta[
     const chatId = await getCurrentChatId()
     const rawConversation = await withImageAssets(await fetchConversation(chatId))
     const enableThinking = ScriptStorage.get<boolean>(KEY_THINKING_ENABLED) ?? false
-    const conversation = processConversation(rawConversation, { enableThinking })
+    const processed = processConversation(rawConversation, { enableThinking })
+    const answer = answerIds && selectAnswer(processed, answerIds)
+    if (answer && answer.conversationNodes.length === 0) {
+        alert(i18n.t('The answer could not be found'))
+        return false
+    }
+    const conversation = answer ?? processed
     const html = conversationToHtml(conversation, userAvatar, metaList)
 
-    const fileName = getFileNameWithFormat(fileNameFormat, 'html', { title: conversation.title, chatId, createTime: conversation.createTime, updateTime: conversation.updateTime })
+    const title = answer ? `${conversation.title}-answer-${answer.answerIndex}` : conversation.title
+    const fileName = getFileNameWithFormat(fileNameFormat, 'html', { title, chatId, createTime: conversation.createTime, updateTime: conversation.updateTime })
     downloadFile(fileName, 'text/html', standardizeLineBreaks(html))
 
     return true
@@ -66,7 +74,7 @@ export async function exportAllToHtml(fileNameFormat: string, apiConversations: 
         else {
             filenameMap.set(fileName, 1)
         }
-        const content = conversationToHtml(conversation, userAvatar, metaList)
+        const content = standardizeLineBreaks(conversationToHtml(conversation, userAvatar, metaList))
         zip.file(fileName, content)
     })
 
@@ -120,8 +128,13 @@ function conversationToHtml(conversation: ConversationResult, avatar: string, me
                 return restore(toHtml(text), formula => escapeHtml(toBracketDelimiters(formula)))
             })
         }
+        else if (message.author.role === 'user' && message.metadata?.serialization_metadata?.render_format === 'markdown') {
+            // ChatGPT stores what a user typed as markdown, a line break is a backslash and a new line.
+            // The page leaves the raw HTML of it out, as it does for a reply.
+            postSteps = [input => `<div class="no-katex">${toHtml(decodeTypedLineBreaks(input))}</div>`]
+        }
         else {
-            // Only assistant replies are markdown. A tool message can hold an uploaded HTML page.
+            // A tool message can hold an uploaded HTML page, text that is not markdown is shown as typed.
             postSteps = [input => `<p class="no-katex">${escapeHtml(input)}</p>`]
         }
         const postProcess = (input: string) => postSteps.reduce((acc, fn) => fn(acc), input)
@@ -164,7 +177,8 @@ function conversationToHtml(conversation: ConversationResult, avatar: string, me
     const date = dateStr()
     const time = new Date().toISOString()
     const source = `${baseUrl}/c/${id}`
-    const lang = document.documentElement.lang ?? 'en'
+    // `lang` is an empty string on a page that does not set it
+    const lang = document.documentElement.lang || 'en'
     const theme = getColorScheme()
 
     const _metaList = resolveMetaList(metaList, getMetaVariables(conversation, source, date))
@@ -217,12 +231,12 @@ function transformContent(
             if (metadata?.aggregate_result?.messages) {
                 return metadata.aggregate_result.messages
                     .filter(msg => msg.message_type === 'image')
-                    .map(msg => `<img src="${msg.image_url}" height="${msg.height}" width="${msg.width}" />`)
+                    .map(msg => `<img src="${escapeHtml(msg.image_url)}" height="${Number(msg.height) || ''}" width="${Number(msg.width) || ''}" />`)
                     .join('\n')
             }
             return postProcess(`Result:\n\`\`\`\n${content.text}\n\`\`\`` || '')
         case 'tether_quote':
-            return postProcess(`> ${content.title || content.text || ''}`)
+            return postProcess((content.title || content.text || '').split('\n').map(line => `> ${line}`).join('\n'))
         case 'tether_browsing_code':
             return postProcess('') // TODO: implement
         case 'tether_browsing_display': {
@@ -237,7 +251,7 @@ function transformContent(
         case 'multimodal_text': {
             return content.parts?.map((part) => {
                 if (typeof part === 'string') return postProcess(part)
-                if (part.content_type === 'image_asset_pointer') return `<img src="${part.asset_pointer}" height="${part.height}" width="${part.width}" />`
+                if (part.content_type === 'image_asset_pointer') return `<img src="${escapeHtml(part.asset_pointer)}" height="${Number(part.height) || ''}" width="${Number(part.width) || ''}" />`
                 if (part.content_type === 'audio_transcription') return `<div style="font-style: italic; opacity: 0.65;">“${escapeHtml(part.text)}”</div>`
                 if (part.content_type === 'audio_asset_pointer') return null
                 if (part.content_type === 'real_time_user_audio_video_asset_pointer') return null
@@ -246,26 +260,26 @@ function transformContent(
         }
         default:
             console.warn('[Exporter] Unsupported Content:', content.content_type, content)
-            return postProcess(`[Unsupported Content: ${content.content_type} ]`)
+            return postProcess(`[Unsupported Content: ${content.content_type}]`)
     }
 }
 
 function formatThinkingHtml(thinking: ThinkingContent): string {
     const durationLabel = thinking.durationSeconds != null
-        ? `Thought for ${thinking.durationSeconds} seconds`
-        : 'Thinking'
+        ? i18n.t('Thought for {{seconds}} seconds', { seconds: thinking.durationSeconds })
+        : i18n.t('Thinking')
 
     const parts: string[] = []
 
     if (thinking.activities?.length) {
-        const items = thinking.activities.map(a => `<li>${escapeHtml(a)}</li>`).join('')
+        const items = thinking.activities.map(a => `<li>${escapeHtml(replaceMarkers(a, 'text'))}</li>`).join('')
         parts.push(`<ul>${items}</ul>`)
     }
 
     const thoughts = thinking.thoughts
         .map(t => t.content || t.summary)
         .filter(Boolean)
-        .map(text => `<p>${escapeHtml(text)}</p>`)
+        .map(text => `<p>${escapeHtml(replaceMarkers(text, 'text'))}</p>`)
         .join('\n')
     if (thoughts) parts.push(thoughts)
 

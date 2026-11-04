@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name               ChatGPT Exporter
-// @name:zh-CN         ChatGPT Exporter
-// @name:zh-TW         ChatGPT Exporter
+// @name               Super ChatGPT Exporter
+// @name:zh-CN         Super ChatGPT Exporter
+// @name:zh-TW         Super ChatGPT Exporter
 // @namespace          pionxzh
 // @version            2.38.0
 // @author             pionxzh
@@ -668,2198 +668,6 @@
 			} catch {}
 		}
 		return null;
-	}
-	var DB_NAME = "chatgpt-exporter";
-	var STORE_NAME = "images";
-	var EXPIRY_MS = 2592e6;
-	var dbPromise = null;
-	function promisify(request) {
-		return new Promise((resolve, reject) => {
-			request.onsuccess = () => resolve(request.result);
-			request.onerror = () => reject(request.error);
-		});
-	}
-	function openDb() {
-		dbPromise ??= new Promise((resolve) => {
-			const request = indexedDB.open(DB_NAME, 1);
-			request.onupgradeneeded = () => {
-				request.result.createObjectStore(STORE_NAME).createIndex("savedAt", "savedAt");
-			};
-			request.onsuccess = () => {
-				pruneExpired(request.result);
-				resolve(request.result);
-			};
-			request.onerror = () => resolve(null);
-		}).catch(() => null);
-		return dbPromise;
-	}
-	function pruneExpired(db) {
-		try {
-			const cursorRequest = db.transaction(STORE_NAME, "readwrite").objectStore(STORE_NAME).index("savedAt").openCursor(IDBKeyRange.upperBound(Date.now() - EXPIRY_MS));
-			cursorRequest.onsuccess = () => {
-				const cursor = cursorRequest.result;
-				if (!cursor) return;
-				cursor.delete();
-				cursor.continue();
-			};
-		} catch (error) {
-			console.warn("[Exporter] Failed to prune image cache", error);
-		}
-	}
-	async function getCachedImage(pointer) {
-		try {
-			const db = await openDb();
-			if (!db) return null;
-			const entry = await promisify(db.transaction(STORE_NAME, "readonly").objectStore(STORE_NAME).get(pointer));
-			if (!entry || Date.now() - entry.savedAt > EXPIRY_MS) return null;
-			return entry.dataUrl;
-		} catch {
-			return null;
-		}
-	}
-	async function setCachedImage(pointer, dataUrl) {
-		try {
-			const db = await openDb();
-			if (!db) return;
-			const entry = {
-				dataUrl,
-				savedAt: Date.now()
-			};
-			await promisify(db.transaction(STORE_NAME, "readwrite").objectStore(STORE_NAME).put(entry, pointer));
-		} catch (error) {
-			console.warn("[Exporter] Failed to cache image", error);
-		}
-	}
-	var generateKey = (args) => JSON.stringify(args);
-	function memorize(fn) {
-		const cache = new Map();
-		const memorized = (...args) => {
-			const key = generateKey(args);
-			if (cache.has(key)) return cache.get(key);
-			const result = fn(...args);
-			cache.set(key, result);
-			return result;
-		};
-		return memorized;
-	}
-	var aliases = [["text-davinci-002", "GPT-3.5"], ["gpt-4-browsing", "GPT-4 (Browser)"]];
-	function getModelName(slug) {
-		const alias = aliases.find(([prefix]) => slug.startsWith(prefix));
-		if (alias) return alias[1];
-		const gpt = /^gpt-(\d+)(o)?(?:-(\d)(?=-|$))?/.exec(slug);
-		if (gpt) {
-			const [, major, omni = "", minor] = gpt;
-			return `GPT-${major}${minor ? `.${minor}` : ""}${omni}`;
-		}
-		const reasoning = /^o\d+/.exec(slug);
-		if (reasoning) return reasoning[0];
-		return "";
-	}
-	var urlcat = typeof import_dist.default === "function" ? import_dist.default : import_dist.default.default;
-	var sessionApi = urlcat(baseUrl, "/api/auth/session");
-	var conversationApi = (id) => urlcat(apiUrl, "/conversation/:id", { id });
-	var shareConversationApi = (id) => urlcat(apiUrl, "/share/:id", { id });
-	var conversationsApi = (offset, limit) => urlcat(apiUrl, "/conversations", {
-		offset,
-		limit
-	});
-	var fileDownloadApi = (id) => urlcat(apiUrl, "/files/download/:id", {
-		id,
-		post_id: "",
-		inline: false
-	});
-	var projectsApi = (cursor) => urlcat(apiUrl, "/gizmos/snorlax/sidebar", {
-		conversations_per_gizmo: 0,
-		cursor
-	});
-	var projectConversationsApi = (gizmo, cursor, limit) => urlcat(apiUrl, "/gizmos/:gizmo/conversations", {
-		gizmo,
-		cursor,
-		limit
-	});
-	var accountsCheckApi = urlcat(apiUrl, "/accounts/check/v4-2023-04-27");
-	async function getCurrentChatId() {
-		if (isSharePage()) {
-			const shareId = getChatIdFromUrl();
-			if (!shareId) throw new Error("No share id found.");
-			return `__share__${shareId}`;
-		}
-		if (isTemporaryChat()) {
-			const temporaryChatId = getTemporaryChatId();
-			if (!temporaryChatId) throw new Error("No temporary chat id found.");
-			return temporaryChatId;
-		}
-		const chatId = getChatIdFromUrl();
-		if (chatId) return chatId;
-		const conversations = await fetchConversations();
-		if (conversations && conversations.items.length > 0) return conversations.items[0].id;
-		throw new Error("No chat id found.");
-	}
-	async function fetchImageFromPointer(uri) {
-		const cached = await getCachedImage(uri);
-		if (cached) return cached;
-		const imageDetails = await fetchApi(fileDownloadApi(uri.replace("sediment://", "")));
-		if (imageDetails.status === "error") {
-			console.error("Failed to fetch image asset", imageDetails.error_code, imageDetails.error_message);
-			return null;
-		}
-		const image = await fetch(imageDetails.download_url);
-		const dataUrl = (await blobToDataURL(await image.blob())).replace(/^data:.*?;/, `data:${image.headers.get("content-type")};`);
-		await setCachedImage(uri, dataUrl);
-		return dataUrl;
-	}
-	async function withImageAssets(conversation) {
-		const copy = structuredClone(conversation);
-		await replaceImageAssets(copy);
-		return copy;
-	}
-	function collectImageSources(conversation) {
-		const isImagePart = (part) => {
-			return typeof part === "object" && part !== null && part.content_type === "image_asset_pointer" && typeof part.asset_pointer === "string";
-		};
-		return Object.values(conversation.mapping).flatMap((node) => {
-			const message = node.message;
-			if (!message) return [];
-			if (message.content.content_type === "multimodal_text") return (Array.isArray(message.content.parts) ? message.content.parts : []).filter(isImagePart).map((part) => ({
-				src: part.asset_pointer,
-				replace: (src) => {
-					part.asset_pointer = src;
-				}
-			}));
-			if (message.content.content_type === "execution_output") return (message.metadata?.aggregate_result?.messages ?? []).filter((msg) => msg.message_type === "image").map((msg) => ({
-				src: msg.image_url,
-				replace: (src) => {
-					msg.image_url = src;
-				}
-			}));
-			return [];
-		});
-	}
-	async function replaceImageSources(conversation, resolve) {
-		await Promise.all(collectImageSources(conversation).map(async (image) => {
-			try {
-				const newSrc = await resolve(image.src);
-				if (newSrc) image.replace(newSrc);
-			} catch (error) {
-				console.error("Failed to fetch image asset", error);
-			}
-		}));
-	}
-	function replaceImageAssets(conversation) {
-		return replaceImageSources(conversation, async (src) => {
-			if (!src.startsWith("sediment://")) return null;
-			return fetchImageFromPointer(src);
-		});
-	}
-	async function fetchConversation(chatId) {
-		if (chatId.startsWith("__share__")) {
-			const id = chatId.replace("__share__", "");
-			return {
-				id,
-				...await loadShareConversation(getConversationFromSharePage(), () => fetchApi(shareConversationApi(id)))
-			};
-		}
-		return {
-			id: chatId,
-			...await fetchApi(conversationApi(chatId))
-		};
-	}
-	async function fetchProjects() {
-		let cursor = null;
-		const allItems = [];
-		while (true) {
-			const { items, cursor: nextCursor = null } = await fetchApi(projectsApi(cursor));
-			cursor = nextCursor;
-			allItems.push(...items);
-			if (nextCursor === null) break;
-		}
-		return allItems.map((gizmo) => gizmo.gizmo.gizmo);
-	}
-	async function fetchConversations(offset = 0, limit = 20, project = null) {
-		if (project) return fetchProjectConversations(project, offset, limit);
-		return fetchApi(conversationsApi(offset, limit));
-	}
-	async function fetchProjectConversations(project, cursor = 0, limit = 20) {
-		const { items, cursor: nextCursor } = await fetchApi(projectConversationsApi(project, cursor, limit));
-		return {
-			has_missing_conversations: false,
-			items,
-			limit,
-			offset: typeof cursor === "number" ? cursor : 0,
-			total: null,
-			cursor: nextCursor ?? null
-		};
-	}
-	async function fetchConversationsPage(project, offset, limit) {
-		return fetchConversations(offset, limit, project);
-	}
-	async function fetchAllConversations(project = null, maxConversations = 1e3, onBatch, onHasMore, onError) {
-		const conversations = [];
-		const limit = project === null ? 100 : 50;
-		let offset = 0;
-		let cursor = 0;
-		while (true) try {
-			const result = project === null ? await fetchConversations(offset, limit) : await fetchProjectConversations(project, cursor, limit);
-			if (!result.items) {
-				console.warn("fetchAllConversations received no items at offset:", offset);
-				break;
-			}
-			conversations.push(...result.items);
-			if (result.items.length === 0) break;
-			onBatch?.(result.items);
-			if (result.total == null && result.cursor == null) break;
-			if (result.total !== null && offset + limit >= result.total) break;
-			if (conversations.length >= maxConversations) break;
-			if (result.cursor != null) cursor = result.cursor;
-			else offset += limit;
-		} catch (error) {
-			console.error("Error fetching conversations batch:", error);
-			onError?.(error);
-			break;
-		}
-		const result = conversations.slice(0, maxConversations);
-		onHasMore?.(result.length >= maxConversations);
-		return result;
-	}
-	async function archiveConversation(chatId) {
-		const { success } = await fetchApi(conversationApi(chatId), {
-			method: "PATCH",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ is_archived: true })
-		});
-		return success;
-	}
-	async function deleteConversation(chatId) {
-		const { success } = await fetchApi(conversationApi(chatId), {
-			method: "PATCH",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ is_visible: false })
-		});
-		return success;
-	}
-	var RateLimitError = class extends Error {
-		retryAfterMs;
-		retryAfterFromServer;
-		constructor(retryAfterHeader) {
-			super("Too Many Requests (429)");
-			this.name = "RateLimitError";
-			const secs = retryAfterHeader != null ? Number.parseInt(retryAfterHeader, 10) : NaN;
-			this.retryAfterFromServer = Number.isFinite(secs) && secs > 0;
-			this.retryAfterMs = this.retryAfterFromServer ? secs * 1e3 : 3e4;
-		}
-	};
-	var RATE_LIMIT_HEADERS = [
-		"retry-after",
-		"x-ratelimit-limit-requests",
-		"x-ratelimit-remaining-requests",
-		"x-ratelimit-reset-requests",
-		"x-ratelimit-limit-tokens",
-		"x-ratelimit-remaining-tokens",
-		"x-ratelimit-reset-tokens"
-	];
-	function logRateLimitHeaders(response) {
-		const found = {};
-		for (const h of RATE_LIMIT_HEADERS) {
-			const val = response.headers.get(h);
-			if (val != null) found[h] = val;
-		}
-		if (Object.keys(found).length > 0) console.info("[Exporter] Rate-limit headers:", found);
-	}
-	async function fetchApi(url, options) {
-		const accessToken = await getAccessToken();
-		const accountId = await getTeamAccountId();
-		const response = await fetch(url, {
-			...options,
-			headers: {
-				"Authorization": `Bearer ${accessToken}`,
-				"X-Authorization": `Bearer ${accessToken}`,
-				...accountId ? { "Chatgpt-Account-Id": accountId } : {},
-				...options?.headers
-			}
-		});
-		logRateLimitHeaders(response);
-		if (!response.ok) {
-			if (response.status === 429) throw new RateLimitError(response.headers.get("Retry-After"));
-			throw new Error(response.statusText);
-		}
-		return response.json();
-	}
-	async function probeApi() {
-		const accessToken = await getAccessToken();
-		const accountId = await getTeamAccountId();
-		const url = conversationsApi(0, 1);
-		const response = await fetch(url, { headers: {
-			"Authorization": `Bearer ${accessToken}`,
-			"X-Authorization": `Bearer ${accessToken}`,
-			...accountId ? { "Chatgpt-Account-Id": accountId } : {}
-		} });
-		const rateLimitHeaders = {};
-		for (const h of RATE_LIMIT_HEADERS) {
-			const val = response.headers.get(h);
-			if (val != null) rateLimitHeaders[h] = val;
-		}
-		if (!response.ok) {
-			if (response.status === 429) {
-				const secs = response.headers.get("retry-after");
-				return {
-					ok: false,
-					retryAfterMs: secs ? Number.parseInt(secs, 10) * 1e3 : 6e4,
-					rateLimitHeaders
-				};
-			}
-			return {
-				ok: false,
-				rateLimitHeaders
-			};
-		}
-		return {
-			ok: true,
-			rateLimitHeaders
-		};
-	}
-	async function _fetchSession() {
-		const response = await fetch(sessionApi);
-		if (!response.ok) throw new Error(response.statusText);
-		return response.json();
-	}
-	var fetchSession = memorize(_fetchSession);
-	async function getAccessToken() {
-		return (await fetchSession()).accessToken;
-	}
-	async function _fetchAccountsCheck() {
-		const accessToken = await getAccessToken();
-		const response = await fetch(accountsCheckApi, { headers: {
-			"Authorization": `Bearer ${accessToken}`,
-			"X-Authorization": `Bearer ${accessToken}`
-		} });
-		if (!response.ok) throw new Error(response.statusText);
-		return response.json();
-	}
-	var fetchAccountsCheck = memorize(_fetchAccountsCheck);
-	var getCookie = (key) => document.cookie.match(`(^|;)\\s*${key}\\s*=\\s*([^;]+)`)?.pop() || "";
-	async function getTeamAccountId() {
-		const accountsCheck = await fetchAccountsCheck();
-		const workspaceId = getCookie("_account");
-		if (workspaceId) {
-			const account = accountsCheck.accounts[workspaceId];
-			if (account) return account.account.account_id;
-		}
-		return null;
-	}
-	function getFileAttachmentNames(message) {
-		return (message.metadata?.attachments ?? []).filter((attachment) => attachment.name && !attachment.mime_type?.startsWith("image/")).map((attachment) => attachment.name);
-	}
-	function shouldSkipMessageInExport(message) {
-		if (!message || !message.content) return true;
-		if (message.recipient !== "all") return true;
-		if (message.content.content_type === "thoughts") return true;
-		if (message.content.content_type === "reasoning_recap") return true;
-		if (message.metadata?.is_visually_hidden_from_conversation) return true;
-		if (message.metadata?.is_thinking_preamble_message) return true;
-		if (message.author.role === "assistant" && message.content.content_type === "text" && !message.content.parts.join("").trim()) return true;
-		if (message.author.role === "tool") {
-			if (message.author.name === "file_search") return true;
-			const hasExecutionImages = message.content.content_type === "execution_output" && !!message.metadata?.aggregate_result?.messages?.some((msg) => msg.message_type === "image");
-			const hasMultimodalImage = message.content.content_type === "multimodal_text" && message.content.parts.some((part) => {
-				return typeof part !== "string" && part.content_type === "image_asset_pointer";
-			});
-			if (!hasExecutionImages && !hasMultimodalImage) return true;
-		}
-		return false;
-	}
-	function processConversation(conversation, options) {
-		const title = conversation.title || "ChatGPT Conversation";
-		const createTime = conversation.create_time;
-		const updateTime = conversation.update_time;
-		const startNodeId = conversation.current_node || Object.values(conversation.mapping).find((node) => !node.children || node.children.length === 0)?.id;
-		if (!startNodeId) throw new Error("Failed to find start node.");
-		const conversationNodes = extractConversationResult(conversation.mapping, startNodeId);
-		const { model, modelSlug } = extractModel(conversation.mapping, conversationNodes);
-		const mergedConversationNodes = mergeContinuationNodes(conversationNodes);
-		if (options?.enableThinking) attachThinkingToNodes(conversation.mapping, mergedConversationNodes, startNodeId);
-		return {
-			id: conversation.id,
-			title,
-			model,
-			modelSlug,
-			createTime,
-			updateTime,
-			conversationNodes: mergedConversationNodes
-		};
-	}
-	function extractModel(conversationMapping, conversationNodes) {
-		const modelSlug = (conversationNodes.findLast((node) => node.message?.metadata?.model_slug) ?? Object.values(conversationMapping).find((node) => node.message?.metadata?.model_slug))?.message?.metadata?.model_slug ?? "";
-		return {
-			model: getModelName(modelSlug),
-			modelSlug
-		};
-	}
-	function extractConversationResult(conversationMapping, startNodeId) {
-		const result = [];
-		let currentNodeId = startNodeId;
-		while (currentNodeId) {
-			const node = conversationMapping[currentNodeId];
-			if (!node) break;
-			if (node.parent === void 0) break;
-			if (node.message?.author.role !== "system" && node.message?.content.content_type !== "model_editable_context" && node.message?.content.content_type !== "user_editable_context" && !shouldSkipMessageInExport(node.message)) result.unshift(copyNode(node));
-			currentNodeId = node.parent;
-		}
-		return result;
-	}
-	function copyNode(node) {
-		const { message } = node;
-		if (!message) return { ...node };
-		const content = message.content.content_type === "text" ? {
-			...message.content,
-			parts: getInteractiveFallbackParts(message) ?? [...message.content.parts]
-		} : message.content;
-		return {
-			...node,
-			message: {
-				...message,
-				content,
-				metadata: message.metadata && { ...message.metadata }
-			}
-		};
-	}
-	function getInteractiveFallbackParts(message) {
-		const markdown = message.metadata?.model_dil_v2?.fallbackMarkdown;
-		if (typeof markdown !== "string" || !markdown.trim() || message.content.content_type !== "text") return null;
-		const markup = message.content.parts.join("");
-		const leading = markup.slice(0, markup.length - markup.trimStart().length);
-		const trailing = markup.slice(markup.trimEnd().length);
-		return [leading + markdown.replaceAll(/<escape>([\s\S]*?)<\/escape>/g, "$1") + trailing];
-	}
-	function mergeContinuationNodes(nodes) {
-		const result = [];
-		for (const node of nodes) {
-			const prevNode = result[result.length - 1];
-			if (prevNode?.message?.author.role === "assistant" && node.message?.author.role === "assistant" && prevNode.message.recipient === "all" && node.message.recipient === "all" && prevNode.message.content.content_type === "text" && node.message.content.content_type === "text") {
-				const separator = prevNode.message.channel !== node.message.channel ? "\n\n" : "";
-				prevNode.message.content.parts[prevNode.message.content.parts.length - 1] += separator + node.message.content.parts[0];
-				prevNode.message.content.parts.push(...node.message.content.parts.slice(1));
-				if (node.message.metadata) {
-					const prevMeta = prevNode.message.metadata ??= {};
-					if (node.message.metadata.citations?.length) prevMeta.citations = [...prevMeta.citations || [], ...node.message.metadata.citations];
-					if (node.message.metadata.content_references?.length) prevMeta.content_references = [...prevMeta.content_references || [], ...node.message.metadata.content_references];
-				}
-			} else result.push(node);
-		}
-		return result;
-	}
-	function hasThinkingContent(thinking) {
-		return thinking.thoughts.length > 0 || thinking.activities != null && thinking.activities.length > 0;
-	}
-	function attachThinkingToNodes(mapping, resultNodes, startNodeId) {
-		const resultNodeIds = new Set(resultNodes.map((n) => n.id));
-		let currentNodeId = startNodeId;
-		let targetNodeId = null;
-		let thinking = { thoughts: [] };
-		while (currentNodeId) {
-			const node = mapping[currentNodeId];
-			if (!node || node.parent === void 0) break;
-			const message = node.message;
-			if (message?.content) {
-				const ct = message.content.content_type;
-				if (resultNodeIds.has(node.id) && message.author.role !== "user") {
-					if (hasThinkingContent(thinking)) {
-						const saveToId = targetNodeId ?? node.id;
-						const target = resultNodes.find((n) => n.id === saveToId);
-						if (target) target.thinking = thinking;
-					}
-					targetNodeId = node.id;
-					thinking = { thoughts: [] };
-				} else if (ct === "reasoning_recap") {
-					const duration = message.metadata?.finished_duration_sec;
-					if (typeof duration === "number") thinking.durationSeconds = duration;
-					else {
-						const match = message.content.content.match(/(\d+)/);
-						if (match) thinking.durationSeconds = Number.parseInt(match[1]);
-					}
-				} else if (ct === "thoughts") thinking.thoughts.unshift(...message.content.thoughts.filter((thought) => thought.content || thought.summary).map((thought) => ({
-					summary: thought.summary,
-					content: thought.content
-				})));
-				else if (ct === "text" && message.metadata?.is_thinking_preamble_message) {
-					const content = message.content.parts.join("\n");
-					if (content) thinking.thoughts.unshift({
-						summary: "",
-						content
-					});
-				} else if (message.metadata?.reasoning_title) {
-					if (!thinking.activities) thinking.activities = [];
-					const title = message.metadata.reasoning_title;
-					const index = thinking.activities.indexOf(title);
-					if (index !== -1) thinking.activities.splice(index, 1);
-					thinking.activities.unshift(title);
-				} else if (message.author.role === "user" && !message.metadata?.is_visually_hidden_from_conversation) {
-					if (targetNodeId && hasThinkingContent(thinking)) {
-						const target = resultNodes.find((n) => n.id === targetNodeId);
-						if (target) target.thinking = thinking;
-					}
-					targetNodeId = null;
-					thinking = { thoughts: [] };
-				}
-			}
-			currentNodeId = node.parent;
-		}
-		if (targetNodeId && hasThinkingContent(thinking)) {
-			const target = resultNodes.find((n) => n.id === targetNodeId);
-			if (target) target.thinking = thinking;
-		}
-	}
-	var t$1;
-	var r;
-	var u;
-	var i;
-	var o$1 = 0;
-	var f = [];
-	var c = [];
-	var e = l$1.__b;
-	var a = l$1.__r;
-	var v = l$1.diffed;
-	var l = l$1.__c;
-	var m = l$1.unmount;
-	function d(t, u) {
-		l$1.__h && l$1.__h(r, t, o$1 || u), o$1 = 0;
-		var i = r.__H || (r.__H = {
-			__: [],
-			__h: []
-		});
-		return t >= i.__.length && i.__.push({ __V: c }), i.__[t];
-	}
-	function h(n) {
-		return o$1 = 1, s(B$1, n);
-	}
-	function s(n, u, i) {
-		var o = d(t$1++, 2);
-		if (o.t = n, !o.__c && (o.__ = [i ? i(u) : B$1(void 0, u), function(n) {
-			var t = o.__N ? o.__N[0] : o.__[0], r = o.t(t, n);
-			t !== r && (o.__N = [r, o.__[1]], o.__c.setState({}));
-		}], o.__c = r, !r.u)) {
-			var f = function(n, t, r) {
-				if (!o.__c.__H) return !0;
-				var u = o.__c.__H.__.filter(function(n) {
-					return n.__c;
-				});
-				if (u.every(function(n) {
-					return !n.__N;
-				})) return !c || c.call(this, n, t, r);
-				var i = !1;
-				return u.forEach(function(n) {
-					if (n.__N) {
-						var t = n.__[0];
-						n.__ = n.__N, n.__N = void 0, t !== n.__[0] && (i = !0);
-					}
-				}), !(!i && o.__c.props === n) && (!c || c.call(this, n, t, r));
-			};
-			r.u = !0;
-			var c = r.shouldComponentUpdate, e = r.componentWillUpdate;
-			r.componentWillUpdate = function(n, t, r) {
-				if (this.__e) {
-					var u = c;
-					c = void 0, f(n, t, r), c = u;
-				}
-				e && e.call(this, n, t, r);
-			}, r.shouldComponentUpdate = f;
-		}
-		return o.__N || o.__;
-	}
-	function p(u, i) {
-		var o = d(t$1++, 3);
-		!l$1.__s && z$1(o.__H, i) && (o.__ = u, o.i = i, r.__H.__h.push(o));
-	}
-	function y(u, i) {
-		var o = d(t$1++, 4);
-		!l$1.__s && z$1(o.__H, i) && (o.__ = u, o.i = i, r.__h.push(o));
-	}
-	function _$1(n) {
-		return o$1 = 5, F$1(function() {
-			return { current: n };
-		}, []);
-	}
-	function F$1(n, r) {
-		var u = d(t$1++, 7);
-		return z$1(u.__H, r) ? (u.__V = n(), u.i = r, u.__h = n, u.__V) : u.__;
-	}
-	function T$1(n, t) {
-		return o$1 = 8, F$1(function() {
-			return n;
-		}, t);
-	}
-	function q$1(n) {
-		var u = r.context[n.__c], i = d(t$1++, 9);
-		return i.c = n, u ? (i.__ ?? (i.__ = !0, u.sub(r)), u.props.value) : n.__;
-	}
-	function V$1() {
-		var n = d(t$1++, 11);
-		if (!n.__) {
-			for (var u = r.__v; null !== u && !u.__m && null !== u.__;) u = u.__;
-			var i = u.__m || (u.__m = [0, 0]);
-			n.__ = "P" + i[0] + "-" + i[1]++;
-		}
-		return n.__;
-	}
-	function b() {
-		for (var t; t = f.shift();) if (t.__P && t.__H) try {
-			t.__H.__h.forEach(k), t.__H.__h.forEach(w$1), t.__H.__h = [];
-		} catch (r) {
-			t.__H.__h = [], l$1.__e(r, t.__v);
-		}
-	}
-	l$1.__b = function(n) {
-		r = null, e && e(n);
-	}, l$1.__r = function(n) {
-		a && a(n), t$1 = 0;
-		var i = (r = n.__c).__H;
-		i && (u === r ? (i.__h = [], r.__h = [], i.__.forEach(function(n) {
-			n.__N && (n.__ = n.__N), n.__V = c, n.__N = n.i = void 0;
-		})) : (i.__h.forEach(k), i.__h.forEach(w$1), i.__h = [], t$1 = 0)), u = r;
-	}, l$1.diffed = function(t) {
-		v && v(t);
-		var o = t.__c;
-		o && o.__H && (o.__H.__h.length && (1 !== f.push(o) && i === l$1.requestAnimationFrame || ((i = l$1.requestAnimationFrame) || j$1)(b)), o.__H.__.forEach(function(n) {
-			n.i && (n.__H = n.i), n.__V !== c && (n.__ = n.__V), n.i = void 0, n.__V = c;
-		})), u = r = null;
-	}, l$1.__c = function(t, r) {
-		r.some(function(t) {
-			try {
-				t.__h.forEach(k), t.__h = t.__h.filter(function(n) {
-					return !n.__ || w$1(n);
-				});
-			} catch (u) {
-				r.some(function(n) {
-					n.__h && (n.__h = []);
-				}), r = [], l$1.__e(u, t.__v);
-			}
-		}), l && l(t, r);
-	}, l$1.unmount = function(t) {
-		m && m(t);
-		var r, u = t.__c;
-		u && u.__H && (u.__H.__.forEach(function(n) {
-			try {
-				k(n);
-			} catch (n) {
-				r = n;
-			}
-		}), u.__H = void 0, r && l$1.__e(r, u.__v));
-	};
-	var g$1 = "function" == typeof requestAnimationFrame;
-	function j$1(n) {
-		var t, r = function() {
-			clearTimeout(u), g$1 && cancelAnimationFrame(t), setTimeout(n);
-		}, u = setTimeout(r, 100);
-		g$1 && (t = requestAnimationFrame(r));
-	}
-	function k(n) {
-		var t = r, u = n.__c;
-		"function" == typeof u && (n.__c = void 0, u()), r = t;
-	}
-	function w$1(n) {
-		var t = r;
-		n.__c = n.__(), r = t;
-	}
-	function z$1(n, t) {
-		return !n || n.length !== t.length || t.some(function(t, r) {
-			return t !== n[r];
-		});
-	}
-	function B$1(n, t) {
-		return "function" == typeof t ? t(n) : t;
-	}
-	function g(n, t) {
-		for (var e in t) n[e] = t[e];
-		return n;
-	}
-	function C(n, t) {
-		for (var e in n) if ("__source" !== e && !(e in t)) return !0;
-		for (var r in t) if ("__source" !== r && n[r] !== t[r]) return !0;
-		return !1;
-	}
-	function E(n, t) {
-		return n === t && (0 !== n || 1 / n == 1 / t) || n != n && t != t;
-	}
-	function w(n) {
-		this.props = n;
-	}
-	(w.prototype = new b$1()).isPureReactComponent = !0, w.prototype.shouldComponentUpdate = function(n, t) {
-		return C(this.props, n) || C(this.state, t);
-	};
-	var R = l$1.__b;
-	l$1.__b = function(n) {
-		n.type && n.type.__f && n.ref && (n.props.ref = n.ref, n.ref = null), R && R(n);
-	};
-	"undefined" != typeof Symbol && Symbol.for;
-	var T = l$1.__e;
-	l$1.__e = function(n, t, e, r) {
-		if (n.then) {
-			for (var u, o = t; o = o.__;) if ((u = o.__c) && u.__c) return t.__e ?? (t.__e = e.__e, t.__k = e.__k), u.__c(n, t);
-		}
-		T(n, t, e, r);
-	};
-	var F = l$1.unmount;
-	function I(n, t, e) {
-		return n && (n.__c && n.__c.__H && (n.__c.__H.__.forEach(function(n) {
-			"function" == typeof n.__c && n.__c();
-		}), n.__c.__H = null), null != (n = g({}, n)).__c && (n.__c.__P === e && (n.__c.__P = t), n.__c = null), n.__k = n.__k && n.__k.map(function(n) {
-			return I(n, t, e);
-		})), n;
-	}
-	function L(n, t, e) {
-		return n && (n.__v = null, n.__k = n.__k && n.__k.map(function(n) {
-			return L(n, t, e);
-		}), n.__c && n.__c.__P === t && (n.__e && e.insertBefore(n.__e, n.__d), n.__c.__e = !0, n.__c.__P = e)), n;
-	}
-	function U() {
-		this.__u = 0, this.t = null, this.__b = null;
-	}
-	function D(n) {
-		var t = n.__.__c;
-		return t && t.__a && t.__a(n);
-	}
-	function V() {
-		this.u = null, this.o = null;
-	}
-	l$1.unmount = function(n) {
-		var t = n.__c;
-		t && t.__R && t.__R(), t && !0 === n.__h && (n.type = null), F && F(n);
-	}, (U.prototype = new b$1()).__c = function(n, t) {
-		var e = t.__c, r = this;
-		r.t ??= [], r.t.push(e);
-		var u = D(r.__v), o = !1, i = function() {
-			o || (o = !0, e.__R = null, u ? u(l) : l());
-		};
-		e.__R = i;
-		var l = function() {
-			if (!--r.__u) {
-				if (r.state.__a) {
-					var n = r.state.__a;
-					r.__v.__k[0] = L(n, n.__c.__P, n.__c.__O);
-				}
-				var t;
-				for (r.setState({ __a: r.__b = null }); t = r.t.pop();) t.forceUpdate();
-			}
-		}, c = !0 === t.__h;
-		r.__u++ || c || r.setState({ __a: r.__b = r.__v.__k[0] }), n.then(i, i);
-	}, U.prototype.componentWillUnmount = function() {
-		this.t = [];
-	}, U.prototype.render = function(n, e) {
-		if (this.__b) {
-			if (this.__v.__k) {
-				var r = document.createElement("div"), o = this.__v.__k[0].__c;
-				this.__v.__k[0] = I(this.__b, r, o.__O = o.__P);
-			}
-			this.__b = null;
-		}
-		var i = e.__a && y$1(k$1, null, n.fallback);
-		return i && (i.__h = null), [y$1(k$1, null, e.__a ? null : n.children), i];
-	};
-	var W = function(n, t, e) {
-		if (++e[1] === e[0] && n.o.delete(t), n.props.revealOrder && ("t" !== n.props.revealOrder[0] || !n.o.size)) for (e = n.u; e;) {
-			for (; e.length > 3;) e.pop()();
-			if (e[1] < e[0]) break;
-			n.u = e = e[2];
-		}
-	};
-	function P(n) {
-		return this.getChildContext = function() {
-			return n.context;
-		}, n.children;
-	}
-	function j(n) {
-		var e = this, r = n.i;
-		e.componentWillUnmount = function() {
-			D$1(null, e.l), e.l = null, e.i = null;
-		}, e.i && e.i !== r && e.componentWillUnmount(), e.l || (e.i = r, e.l = {
-			nodeType: 1,
-			parentNode: r,
-			childNodes: [],
-			appendChild: function(n) {
-				this.childNodes.push(n), e.i.appendChild(n);
-			},
-			insertBefore: function(n, t) {
-				this.childNodes.push(n), e.i.appendChild(n);
-			},
-			removeChild: function(n) {
-				this.childNodes.splice(this.childNodes.indexOf(n) >>> 1, 1), e.i.removeChild(n);
-			}
-		}), D$1(y$1(P, { context: e.context }, n.__v), e.l);
-	}
-	function z(n, e) {
-		var r = y$1(j, {
-			__v: n,
-			i: e
-		});
-		return r.containerInfo = e, r;
-	}
-	(V.prototype = new b$1()).__a = function(n) {
-		var t = this, e = D(t.__v), r = t.o.get(n);
-		return r[0]++, function(u) {
-			var o = function() {
-				t.props.revealOrder ? (r.push(u), W(t, n, r)) : u();
-			};
-			e ? e(o) : o();
-		};
-	}, V.prototype.render = function(n) {
-		this.u = null, this.o = new Map();
-		var t = C$1(n.children);
-		n.revealOrder && "b" === n.revealOrder[0] && t.reverse();
-		for (var e = t.length; e--;) this.o.set(t[e], this.u = [
-			1,
-			0,
-			this.u
-		]);
-		return n.children;
-	}, V.prototype.componentDidUpdate = V.prototype.componentDidMount = function() {
-		var n = this;
-		this.o.forEach(function(t, e) {
-			W(n, e, t);
-		});
-	};
-	var B = "undefined" != typeof Symbol && Symbol.for && Symbol.for("react.element") || 60103;
-	var H = /^(?:accent|alignment|arabic|baseline|cap|clip(?!PathU)|color|dominant|fill|flood|font|glyph(?!R)|horiz|image(!S)|letter|lighting|marker(?!H|W|U)|overline|paint|pointer|shape|stop|strikethrough|stroke|text(?!L)|transform|underline|unicode|units|v|vector|vert|word|writing|x(?!C))[A-Z]/;
-	var Z = /^on(Ani|Tra|Tou|BeforeInp|Compo)/;
-	var Y = /[A-Z0-9]/g;
-	var $ = "undefined" != typeof document;
-	var q = function(n) {
-		return ("undefined" != typeof Symbol && "symbol" == typeof Symbol() ? /fil|che|rad/ : /fil|che|ra/).test(n);
-	};
-	b$1.prototype.isReactComponent = {}, [
-		"componentWillMount",
-		"componentWillReceiveProps",
-		"componentWillUpdate"
-	].forEach(function(t) {
-		Object.defineProperty(b$1.prototype, t, {
-			configurable: !0,
-			get: function() {
-				return this["UNSAFE_" + t];
-			},
-			set: function(n) {
-				Object.defineProperty(this, t, {
-					configurable: !0,
-					writable: !0,
-					value: n
-				});
-			}
-		});
-	});
-	var K = l$1.event;
-	function Q() {}
-	function X() {
-		return this.cancelBubble;
-	}
-	function nn() {
-		return this.defaultPrevented;
-	}
-	l$1.event = function(n) {
-		return K && (n = K(n)), n.persist = Q, n.isPropagationStopped = X, n.isDefaultPrevented = nn, n.nativeEvent = n;
-	};
-	var en = {
-		enumerable: !1,
-		configurable: !0,
-		get: function() {
-			return this.class;
-		}
-	};
-	var rn = l$1.vnode;
-	l$1.vnode = function(n) {
-		"string" == typeof n.type && function(n) {
-			var t = n.props, e = n.type, u = {};
-			for (var o in t) {
-				var i = t[o];
-				if (!("value" === o && "defaultValue" in t && null == i || $ && "children" === o && "noscript" === e || "class" === o || "className" === o)) {
-					var l = o.toLowerCase();
-					"defaultValue" === o && "value" in t && null == t.value ? o = "value" : "download" === o && !0 === i ? i = "" : "ondoubleclick" === l ? o = "ondblclick" : "onchange" !== l || "input" !== e && "textarea" !== e || q(t.type) ? "onfocus" === l ? o = "onfocusin" : "onblur" === l ? o = "onfocusout" : Z.test(o) ? o = l : -1 === e.indexOf("-") && H.test(o) ? o = o.replace(Y, "-$&").toLowerCase() : null === i && (i = void 0) : l = o = "oninput", "oninput" === l && u[o = l] && (o = "oninputCapture"), u[o] = i;
-				}
-			}
-			"select" == e && u.multiple && Array.isArray(u.value) && (u.value = C$1(t.children).forEach(function(n) {
-				n.props.selected = -1 != u.value.indexOf(n.props.value);
-			})), "select" == e && null != u.defaultValue && (u.value = C$1(t.children).forEach(function(n) {
-				n.props.selected = u.multiple ? -1 != u.defaultValue.indexOf(n.props.value) : u.defaultValue == n.props.value;
-			})), t.class && !t.className ? (u.class = t.class, Object.defineProperty(u, "className", en)) : (t.className && !t.class || t.class && t.className) && (u.class = u.className = t.className), n.props = u;
-		}(n), n.$$typeof = B, rn && rn(n);
-	};
-	var un = l$1.__r;
-	l$1.__r = function(n) {
-		un && un(n), n.__c;
-	};
-	var on = l$1.diffed;
-	l$1.diffed = function(n) {
-		on && on(n);
-		var t = n.props, e = n.__e;
-		null != e && "textarea" === n.type && "value" in t && t.value !== e.value && (e.value = null == t.value ? "" : t.value);
-	};
-	function En(n, t) {
-		var e = t(), r = h({ h: {
-			__: e,
-			v: t
-		} }), u = r[0].h, o = r[1];
-		return y(function() {
-			u.__ = e, u.v = t, E(u.__, t()) || o({ h: u });
-		}, [
-			n,
-			e,
-			t
-		]), p(function() {
-			return E(u.__, u.v()) || o({ h: u }), n(function() {
-				E(u.__, u.v()) || o({ h: u });
-			});
-		}, [n]), e;
-	}
-	var en_default = {
-		title: "ChatGPT Exporter",
-		ExportHelper: "Export",
-		Setting: "Setting",
-		Language: "Language",
-		"Copy Text": "Copy Text",
-		"Copied!": "Copied!",
-		Screenshot: "Screenshot",
-		Markdown: "Markdown",
-		HTML: "HTML",
-		JSON: "JSON",
-		Archive: "Archive",
-		Save: "Save",
-		Delete: "Delete",
-		Cancel: "Cancel",
-		"Select All": "Select All",
-		"Select...": "Select...",
-		"Select Not Exported": "Select Not Exported",
-		"Select Updated": "Select Updated",
-		"Shift Select Hint": "Tip: Shift+click to select a range",
-		Export: "Export",
-		Error: "Error",
-		Loading: "Loading",
-		Preview: "Preview",
-		"File Name": "File Name",
-		"Export All": "Export All",
-		"Exporter Settings": "Exporter Settings",
-		"Export Dialog Title": "Export Conversations",
-		"Invalid File Format": "Invalid File Format",
-		"Export from official export file": "Export from official export file",
-		"Export from API": "Export from API",
-		"Available variables": "Available variables",
-		"Conversation Timestamp": "Conversation Timestamp",
-		"Conversation Timestamp Description": "Will show on the page.",
-		"Enable on HTML": "Enable on HTML files",
-		"Enable on Markdown": "Enable on Markdown files",
-		"Use 24-hour format": "Use 24-hour format (eg. 23:59)",
-		"Export Format": "Export Format",
-		"Export Metadata": "Export Metadata",
-		"Export Metadata Description": "Add metadata to exported Markdown and HTML files.",
-		"Export Thinking Process": "Export Thinking Process",
-		"Export Thinking Process Description": "Include the model's thinking/reasoning process in exported Markdown and HTML files.",
-		"Export Sources": "Export Sources",
-		"Export Sources Description": "Include the source list shown at the end of each answer in exported Markdown and HTML files.",
-		Images: "Images",
-		"Images Description": "How images are saved in Markdown and JSON (ZIP) exports. When left out, Markdown shows [image] instead. HTML always embeds images.",
-		"Images Embed": "Embed in the file (base64)",
-		"Images Omit": "Leave out images",
-		"Images Files": "Save as separate files (.zip)",
-		Sources: "Sources",
-		"OpenAI Official Format": "OpenAI Official Format",
-		"Conversation Archive Alert": "Are you sure you want to archive all selected conversations?",
-		"Conversation Archived Message": "All selected conversations have been archived. Please refresh the page to see the changes.",
-		"Conversation Delete Alert": "Are you sure you want to delete all selected conversations?",
-		"Conversation Deleted Message": "All selected conversations have been deleted. Please refresh the page to see the changes.",
-		"Please start a conversation first": "Please start a conversation first.",
-		"Temporary chat could not be captured": "This temporary chat could not be read. It may have started before the exporter was loaded. You can still export it as a PNG screenshot.",
-		"Select Project": "Select Project",
-		"(no project)": "(no project)",
-		"Export All Limit": "Export All Limit",
-		"Export All Limit Description": "Set the maximum number of conversations to load. Exports run in waves of 100 conversations to stay within API rate limits.",
-		"Select a source to load conversations": "Select a project above to load conversations.",
-		Search: "Search",
-		"No results": "No results",
-		"Batch progress": "Batch {{current}}/{{total}}",
-		"All conversations": "All conversations",
-		"Load more conversations": "Load {{n}} more",
-		"Load more conversations remaining": "Load {{n}} more · {{remaining}} left",
-		"Export Skipped Message": "{{n}} conversations failed after repeated retries and are missing from the export:",
-		"List Rate Limited Wait": "Rate limited by the API · wait {{n}}s and try again",
-		"List Rate Limited": "Rate limited by the API · try again in a moment",
-		"List Load Failed": "Failed to load conversations"
-	};
-	var es_default = {
-		title: "ChatGPT Exporter",
-		ExportHelper: "Exportar",
-		Setting: "Ajustes",
-		Language: "Idioma",
-		"Copy Text": "Copiar Texto",
-		"Copied!": "¡Copiado!",
-		Screenshot: "Captura",
-		Markdown: "Markdown",
-		HTML: "HTML",
-		JSON: "JSON",
-		Archive: "Archivo",
-		Save: "Guardar",
-		Delete: "Borrar",
-		Cancel: "Cancelar",
-		"Select All": "Seleccionar Todos",
-		"Select...": "Selección…",
-		"Select Not Exported": "Seleccionar conversaciones no exportadas",
-		"Select Updated": "Seleccionar conversaciones actualizadas",
-		"Shift Select Hint": "Consejo: Shift+clic para seleccionar un rango",
-		Export: "Exportar",
-		Error: "Error",
-		Loading: "Cargando",
-		Preview: "Previsualizar",
-		"File Name": "Nombre del Archivo",
-		"Export All": "Exportar Todos",
-		"Exporter Settings": "Ajustes De Exportación",
-		"Export Dialog Title": "Exportar Conversaciones",
-		"Invalid File Format": "Formato de archivo inválido",
-		"Export from official export file": "Exportar desde archivo de exportación oficial",
-		"Export from API": "Exportar desde API",
-		"Available variables": "Variables Disponibles",
-		"Conversation Timestamp": "Marca de Tiempo",
-		"Conversation Timestamp Description": "Aparecerá en la página.",
-		"Enable on HTML": "Habilitar en archivos HTML",
-		"Enable on Markdown": "Habilitar en archivos Markdown",
-		"Use 24-hour format": "Usar formato de 24 horas (ej. 23:59)",
-		"Export Format": "Formato de Exportación",
-		"Export Metadata": "Exportar Metadatos",
-		"Export Metadata Description": "Añadir Metadatos a los archivos Markdown y HTML exportados.",
-		"Export Thinking Process": "Exportar Proceso de Pensamiento",
-		"Export Thinking Process Description": "Incluir el proceso de pensamiento/razonamiento del modelo en los archivos Markdown y HTML exportados.",
-		"Export Sources": "Exportar fuentes",
-		"Export Sources Description": "Incluir la lista de fuentes que se muestra al final de cada respuesta en los archivos Markdown y HTML exportados.",
-		Images: "Imágenes",
-		"Images Description": "Cómo se guardan las imágenes en las exportaciones Markdown y JSON (ZIP). Si se omiten, Markdown muestra [image] en su lugar. HTML siempre incrusta las imágenes.",
-		"Images Embed": "Incrustar en el archivo (base64)",
-		"Images Omit": "Omitir imágenes",
-		"Images Files": "Guardar como archivos separados (.zip)",
-		Sources: "Fuentes",
-		"OpenAI Official Format": "Formato Oficial de OpenAI",
-		"Conversation Archive Alert": "¿Estás seguro que quieres archivar todas las conversaciones seleccionadas?",
-		"Conversation Archived Message": "Todos las conversaciones seleccionadas se han archivado. Por favor refresca la página para ver los cambios.",
-		"Conversation Delete Alert": "¿Estás seguro que quieres borrar todas las conversaciones seleccionadas?",
-		"Conversation Deleted Message": "Todos las conversaciones seleccionadas se han borrado. Por favor refresca la página para ver los cambios.",
-		"Please start a conversation first": "Por favor empieza una conversación antes.",
-		"Temporary chat could not be captured": "No se pudo leer este chat temporal. Es posible que haya comenzado antes de que se cargara el exportador. Aún puedes exportarlo como una captura de pantalla PNG.",
-		"Select Project": "Seleccionar proyecto",
-		"(no project)": "(sin proyecto)",
-		"Export All Limit": "Límite de Exportar Todos",
-		"Export All Limit Description": "Establece el número máximo de conversaciones a cargar en el diálogo 'Exportar Todos'.",
-		"Select a source to load conversations": "Selecciona un proyecto arriba para cargar conversaciones.",
-		Search: "Buscar",
-		"No results": "Sin resultados",
-		"Batch progress": "Lote {{current}}/{{total}}",
-		"All conversations": "Todas las conversaciones",
-		"Load more conversations": "Cargar {{n}} más",
-		"Load more conversations remaining": "Cargar {{n}} más · quedan {{remaining}}",
-		"Export Skipped Message": "{{n}} conversaciones fallaron tras varios reintentos y no están en la exportación:",
-		"List Rate Limited Wait": "Límite de solicitudes de la API · espera {{n}} s y vuelve a intentarlo",
-		"List Rate Limited": "Límite de solicitudes de la API · vuelve a intentarlo en un momento",
-		"List Load Failed": "No se pudieron cargar las conversaciones"
-	};
-	var fr_default = {
-		title: "Exportateur ChatGPT",
-		ExportHelper: "Exporter",
-		Setting: "Paramètre",
-		Language: "Langue",
-		"Copy Text": "Copier le texte",
-		"Copied!": "Copié !",
-		Screenshot: "Capture",
-		Markdown: "Markdown",
-		HTML: "HTML",
-		JSON: "JSON",
-		Archive: "Archiver",
-		Save: "Enregistrer",
-		Delete: "Supprimer",
-		Cancel: "Annuler",
-		"Select All": "Tout sélectionner",
-		"Select...": "Sélection…",
-		"Select Not Exported": "Sélectionner les conversations non exportées",
-		"Select Updated": "Sélectionner les conversations mises à jour",
-		"Shift Select Hint": "Astuce : Maj+clic pour sélectionner une plage",
-		Export: "Exporter",
-		Error: "Erreur",
-		Loading: "Chargement",
-		Preview: "Aperçu",
-		"File Name": "Nom du fichier",
-		"Export All": "Tout exporter",
-		"Exporter Settings": "Paramètres de l'exportateur",
-		"Export Dialog Title": "Exporter les conversations",
-		"Invalid File Format": "Format de fichier invalide",
-		"Export from official export file": "Exporter depuis un fichier officiel",
-		"Export from API": "Exporter depuis l'API",
-		"Available variables": "Variables disponibles",
-		"Conversation Timestamp": "Horodatage de la conversation",
-		"Conversation Timestamp Description": "S'affichera sur la page.",
-		"Enable on HTML": "Activer sur les fichiers HTML",
-		"Enable on Markdown": "Activer sur les fichiers Markdown",
-		"Use 24-hour format": "Utiliser le format 24 heures (ex. 23:59)",
-		"Export Format": "Format d'exportation",
-		"Export Metadata": "Exporter les métadonnées",
-		"Export Metadata Description": "Ajouter des métadonnées aux fichiers Markdown et HTML exportés.",
-		"Export Thinking Process": "Exporter le processus de réflexion",
-		"Export Thinking Process Description": "Inclure le processus de réflexion/raisonnement du modèle dans les fichiers Markdown et HTML exportés.",
-		"Export Sources": "Exporter les sources",
-		"Export Sources Description": "Inclure la liste des sources affichée à la fin de chaque réponse dans les fichiers Markdown et HTML exportés.",
-		Images: "Images",
-		"Images Description": "Comment les images sont enregistrées dans les exports Markdown et JSON (ZIP). Si elles sont omises, Markdown affiche [image] à la place. HTML intègre toujours les images.",
-		"Images Embed": "Intégrer dans le fichier (base64)",
-		"Images Omit": "Omettre les images",
-		"Images Files": "Enregistrer en fichiers séparés (.zip)",
-		Sources: "Sources",
-		"OpenAI Official Format": "Format officiel OpenAI",
-		"Conversation Archive Alert": "Êtes-vous sûr de vouloir archiver toutes les conversations sélectionnées ?",
-		"Conversation Archived Message": "Toutes les conversations sélectionnées ont été archivées. Veuillez actualiser la page pour voir les changements.",
-		"Conversation Delete Alert": "Êtes-vous sûr de vouloir supprimer toutes les conversations sélectionnées ?",
-		"Conversation Deleted Message": "Toutes les conversations sélectionnées ont été supprimées. Veuillez actualiser la page pour voir les changements.",
-		"Please start a conversation first": "Veuillez commencer une conversation d'abord.",
-		"Temporary chat could not be captured": "Ce chat éphémère n'a pas pu être lu. Il a peut-être commencé avant le chargement de l'exportateur. Vous pouvez toujours l'exporter en capture d'écran PNG.",
-		"Select Project": "Sélectionner un projet",
-		"(no project)": "(aucun projet)",
-		"Export All Limit": "Limite d'Exportation Multiple",
-		"Export All Limit Description": "Définit le nombre maximal de conversations à charger dans la boîte de dialogue 'Tout exporter'.",
-		"Select a source to load conversations": "Sélectionnez un projet ci-dessus pour charger les conversations.",
-		Search: "Rechercher",
-		"No results": "Aucun résultat",
-		"Batch progress": "Lot {{current}}/{{total}}",
-		"All conversations": "Toutes les conversations",
-		"Load more conversations": "Charger {{n}} de plus",
-		"Load more conversations remaining": "Charger {{n}} de plus · {{remaining}} restantes",
-		"Export Skipped Message": "{{n}} conversations ont échoué après plusieurs tentatives et ne figurent pas dans l'export :",
-		"List Rate Limited Wait": "Limite de requêtes de l'API atteinte · attendez {{n}} s et réessayez",
-		"List Rate Limited": "Limite de requêtes de l'API atteinte · réessayez dans un instant",
-		"List Load Failed": "Impossible de charger les conversations"
-	};
-	var id_default = {
-		title: "ChatGPT Exporter",
-		ExportHelper: "Ekspor",
-		Setting: "Pengaturan",
-		Language: "Bahasa",
-		"Copy Text": "Salin Teks",
-		"Copied!": "Disalin!",
-		Screenshot: "Screenshot",
-		Markdown: "Markdown",
-		HTML: "HTML",
-		JSON: "JSON",
-		Archive: "Arsip",
-		Save: "Simpan",
-		Delete: "Hapus",
-		Cancel: "Batal",
-		"Select All": "Pilih Semua",
-		"Select...": "Pilih massal…",
-		"Select Not Exported": "Pilih percakapan yang belum diekspor",
-		"Select Updated": "Pilih percakapan yang diperbarui",
-		"Shift Select Hint": "Tips: Shift+klik untuk memilih rentang",
-		Export: "Ekspor",
-		Error: "Kesalahan",
-		Loading: "Memuat",
-		Preview: "Pratinjau",
-		"File Name": "Nama File",
-		"Export All": "Ekspor Semua",
-		"Exporter Settings": "Pengaturan Pengekspor",
-		"Export Dialog Title": "Ekspor Percakapan",
-		"Invalid File Format": "Format File Tidak Valid",
-		"Export from official export file": "Ekspor dari file ekspor resmi",
-		"Export from API": "Ekspor dari API",
-		"Available variables": "Variabel yang Tersedia",
-		"Conversation Timestamp": "Timestamp Percakapan",
-		"Conversation Timestamp Description": "Akan ditampilkan pada halaman.",
-		"Enable on HTML": "Aktifkan pada file HTML",
-		"Enable on Markdown": "Aktifkan pada file Markdown",
-		"Use 24-hour format": "Gunakan format 24 jam (contohnya: 23:59)",
-		"Export Format": "Format Ekspor",
-		"Export Metadata": "Ekspor Metada",
-		"Export Metadata Description": "Tambahkan metadata ke file Markdown dan HTML yang diekspor.",
-		"Export Thinking Process": "Ekspor Proses Berpikir",
-		"Export Thinking Process Description": "Sertakan proses berpikir/penalaran model dalam file Markdown dan HTML yang diekspor.",
-		"Export Sources": "Ekspor Sumber",
-		"Export Sources Description": "Sertakan daftar sumber yang ditampilkan di akhir setiap jawaban dalam file Markdown dan HTML yang diekspor.",
-		Images: "Gambar",
-		"Images Description": "Cara gambar disimpan dalam ekspor Markdown dan JSON (ZIP). Jika dihilangkan, Markdown menampilkan [image] sebagai gantinya. HTML selalu menyematkan gambar.",
-		"Images Embed": "Sematkan di file (base64)",
-		"Images Omit": "Hilangkan gambar",
-		"Images Files": "Simpan sebagai file terpisah (.zip)",
-		Sources: "Sumber",
-		"OpenAI Official Format": "Format Resmi OpenAI",
-		"Conversation Archive Alert": "Apakah Anda yakin ingin mengarsipkan semua percakapan yang dipilih?",
-		"Conversation Archived Message": "Semua percakapan yang dipilih telah diarsipkan. Harap segarkan halaman untuk melihat perubahan.",
-		"Conversation Delete Alert": "Apakah Anda yakin ingin menghapus semua percakapan yang dipilih?",
-		"Conversation Deleted Message": "Semua percakapan yang dipilih telah dihapus. Harap segarkan halaman untuk melihat perubahan.",
-		"Please start a conversation first": "Harap mulai percakapan terlebih dahulu.",
-		"Temporary chat could not be captured": "Obrolan sementara ini tidak dapat dibaca. Mungkin obrolan dimulai sebelum pengekspor dimuat. Anda masih dapat mengekspornya sebagai tangkapan layar PNG.",
-		"Select Project": "Pilih Proyek",
-		"(no project)": "(tidak ada proyek)",
-		"Export All Limit": "Batas Ekspor Semua",
-		"Export All Limit Description": "Atur jumlah maksimum percakapan yang akan dimuat dalam dialog 'Ekspor Semua'.",
-		"Select a source to load conversations": "Pilih proyek di atas untuk memuat percakapan.",
-		Search: "Cari",
-		"No results": "Tidak ada hasil",
-		"Batch progress": "Kelompok {{current}}/{{total}}",
-		"All conversations": "Semua percakapan",
-		"Load more conversations": "Muat {{n}} lagi",
-		"Load more conversations remaining": "Muat {{n}} lagi · tersisa {{remaining}}",
-		"Export Skipped Message": "{{n}} percakapan gagal setelah beberapa kali dicoba ulang dan tidak ada dalam ekspor:",
-		"List Rate Limited Wait": "Dibatasi oleh API · tunggu {{n}} dtk lalu coba lagi",
-		"List Rate Limited": "Dibatasi oleh API · coba lagi sebentar lagi",
-		"List Load Failed": "Gagal memuat percakapan"
-	};
-	var jp_default = {
-		title: "ChatGPTエクスポーター",
-		ExportHelper: "エクスポート",
-		Setting: "設定",
-		Language: "言語",
-		"Copy Text": "テキストをコピー",
-		"Copied!": "コピーしました！",
-		Screenshot: "キャプチャ",
-		Markdown: "Markdown",
-		HTML: "HTML",
-		JSON: "JSON",
-		Archive: "アーカイブ",
-		Save: "保存",
-		Delete: "削除",
-		Cancel: "キャンセル",
-		"Select All": "すべて選択",
-		"Select...": "一括選択…",
-		"Select Not Exported": "未エクスポートの会話を選択",
-		"Select Updated": "更新された会話を選択",
-		"Shift Select Hint": "ヒント: Shift+クリックで範囲選択",
-		Export: "エクスポート",
-		Error: "エラー",
-		Loading: "読み込み中",
-		Preview: "プレビュー",
-		"File Name": "ファイル名",
-		"Export All": "すべてエクスポート",
-		"Exporter Settings": "エクスポーター設定",
-		"Export Dialog Title": "会話をエクスポート",
-		"Invalid File Format": "無効なファイル形式",
-		"Export from official export file": "公式エクスポートファイルからエクスポートする",
-		"Export from API": "APIからエクスポートする",
-		"Available variables": "使用可能な変数",
-		"Conversation Timestamp": "会話のタイムスタンプ",
-		"Conversation Timestamp Description": "ページに表示されます。",
-		"Enable on HTML": "HTML ファイルで有効にする",
-		"Enable on Markdown": "Markdown ファイルで有効にする",
-		"Use 24-hour format": "24時間形式を使用する (例: 23:59)",
-		"Export Format": "エクスポートフォーマット",
-		"Export Metadata": "メタデータをエクスポート",
-		"Export Metadata Description": "エクスポートされたMarkdownおよびHTMLファイルにメタデータを追加します。",
-		"Export Thinking Process": "思考プロセスをエクスポート",
-		"Export Thinking Process Description": "エクスポートされたMarkdownおよびHTMLファイルにモデルの思考・推論プロセスを含めます。",
-		"Export Sources": "ソースをエクスポート",
-		"Export Sources Description": "各回答の末尾に表示されるソース一覧を、エクスポートされた Markdown および HTML ファイルに含めます。",
-		Images: "画像",
-		"Images Description": "Markdown と JSON (ZIP) のエクスポートでの画像の保存方法。省略した場合、Markdown では代わりに [image] と表示されます。HTML では常に画像が埋め込まれます。",
-		"Images Embed": "ファイルに埋め込む (base64)",
-		"Images Omit": "画像を省略",
-		"Images Files": "別ファイルとして保存 (.zip)",
-		Sources: "出典",
-		"OpenAI Official Format": "OpenAI公式フォーマット",
-		"Conversation Archive Alert": "選択したすべての会話をアーカイブしてもよろしいですか？",
-		"Conversation Archived Message": "選択したすべての会話がアーカイブされました。変更を表示するには、ページを更新してください。",
-		"Conversation Delete Alert": "選択したすべての会話を削除してもよろしいですか？",
-		"Conversation Deleted Message": "選択したすべての会話が削除されました。変更を表示するには、ページを更新してください。",
-		"Please start a conversation first": "まず会話を開始してください。",
-		"Temporary chat could not be captured": "この一時チャットを読み取れませんでした。エクスポーターが読み込まれる前に開始された可能性があります。PNG スクリーンショットとしてエクスポートすることは可能です。",
-		"Select Project": "プロジェクトを選択",
-		"(no project)": "（プロジェクトなし）",
-		"Export All Limit": "すべてエクスポートの上限",
-		"Export All Limit Description": "「すべてエクスポート」ダイアログで読み込む会話の最大数を設定します。",
-		"Select a source to load conversations": "上からプロジェクトを選択して会話を読み込んでください。",
-		Search: "検索",
-		"No results": "結果なし",
-		"Batch progress": "バッチ {{current}}/{{total}}",
-		"All conversations": "すべての会話",
-		"Load more conversations": "さらに {{n}} 件読み込む",
-		"Load more conversations remaining": "さらに {{n}} 件読み込む · 残り {{remaining}} 件",
-		"Export Skipped Message": "{{n}} 件の会話は再試行しても失敗したため、エクスポートに含まれていません：",
-		"List Rate Limited Wait": "リクエストが多すぎます · {{n}} 秒後に再試行してください",
-		"List Rate Limited": "リクエストが多すぎます · しばらくしてから再試行してください",
-		"List Load Failed": "会話を読み込めませんでした"
-	};
-	var ru_default = {
-		title: "ChatGPT Exporter",
-		ExportHelper: "Export",
-		Setting: "Параметры",
-		Language: "Язык",
-		"Copy Text": "Копировать текст",
-		"Copied!": "Скопировано!",
-		Screenshot: "Скриншот",
-		Markdown: "Markdown",
-		HTML: "HTML",
-		JSON: "JSON",
-		Archive: "Архивировать",
-		Save: "Сохранить",
-		Delete: "Удалить",
-		Cancel: "Отмена",
-		"Select All": "Выбрать все",
-		"Select...": "Выбрать…",
-		"Select Not Exported": "Выбрать неэкспортированные разговоры",
-		"Select Updated": "Выбрать обновлённые разговоры",
-		"Shift Select Hint": "Совет: Shift+клик выбирает диапазон",
-		Export: "Экспорт",
-		Error: "Ошибка",
-		Loading: "Загрузка",
-		Preview: "Предпросмотр",
-		"File Name": "Имя файла",
-		"Export All": "Экспортировать все",
-		"Exporter Settings": "Параметры экспорта",
-		"Export Dialog Title": "Экспортировать беседы",
-		"Invalid File Format": "Неверный формат файла",
-		"Export from official export file": "Экспорт из официального файла",
-		"Export from API": "Экспорт из API",
-		"Available variables": "Доступные переменные",
-		"Conversation Timestamp": "Временная метка разговора",
-		"Conversation Timestamp Description": "Будет отображаться на странице.",
-		"Enable on HTML": "Включить для HTML-файлов",
-		"Enable on Markdown": "Включить для файлов Markdown",
-		"Use 24-hour format": "Использовать 24-часовой формат (например, 23:59)",
-		"Export Format": "Формат экспорта",
-		"Export Metadata": "Экспорт метаданных",
-		"Export Metadata Description": "Добавляйте метаданные в экспортированные файлы Markdown и HTML.",
-		"Export Thinking Process": "Экспорт процесса мышления",
-		"Export Thinking Process Description": "Включить процесс мышления/рассуждения модели в экспортированные файлы Markdown и HTML.",
-		"Export Sources": "Экспорт источников",
-		"Export Sources Description": "Включить список источников, показанный в конце каждого ответа, в экспортированные файлы Markdown и HTML.",
-		Images: "Изображения",
-		"Images Description": "Как сохранять изображения при экспорте в Markdown и JSON (ZIP). Если изображения пропущены, в Markdown вместо них будет [image]. HTML всегда встраивает изображения.",
-		"Images Embed": "Встроить в файл (base64)",
-		"Images Omit": "Не включать изображения",
-		"Images Files": "Сохранить отдельными файлами (.zip)",
-		Sources: "Источники",
-		"OpenAI Official Format": "Официальный формат OpenAI",
-		"Conversation Archive Alert": "Вы уверены, что хотите архивировать все выбранные разговоры?",
-		"Conversation Archived Message": "Все выбранные разговоры были заархивированы. Пожалуйста, обновите страницу, чтобы увидеть изменения.",
-		"Conversation Delete Alert": "Вы уверены, что хотите удалить все выбранные разговоры?",
-		"Conversation Deleted Message": "Все выбранные разговоры были удалены. Пожалуйста, обновите страницу, чтобы увидеть изменения.",
-		"Please start a conversation first": "Пожалуйста, начните разговор первым.",
-		"Temporary chat could not be captured": "Не удалось прочитать этот временный чат. Возможно, он был начат до загрузки экспортёра. Вы всё ещё можете экспортировать его как PNG-скриншот.",
-		"Select Project": "Выберите проект",
-		"(no project)": "(нет проекта)",
-		"Export All Limit": "Лимит экспорта всех",
-		"Export All Limit Description": "Установите максимальное количество бесед для загрузки в диалоге 'Экспортировать все'.",
-		"Select a source to load conversations": "Выберите проект выше, чтобы загрузить беседы.",
-		Search: "Поиск",
-		"No results": "Нет результатов",
-		"Batch progress": "Партия {{current}}/{{total}}",
-		"All conversations": "Все разговоры",
-		"Load more conversations": "Загрузить ещё {{n}}",
-		"Load more conversations remaining": "Загрузить ещё {{n}} · осталось {{remaining}}",
-		"Export Skipped Message": "{{n}} разговоров не удалось загрузить после нескольких попыток, они отсутствуют в экспорте:",
-		"List Rate Limited Wait": "Слишком много запросов к API · подождите {{n}} с и попробуйте снова",
-		"List Rate Limited": "Слишком много запросов к API · попробуйте чуть позже",
-		"List Load Failed": "Не удалось загрузить беседы"
-	};
-	var tr_default = {
-		title: "ChatGPT Exporter",
-		ExportHelper: "Dışa Aktar",
-		Setting: "Ayarlar",
-		Language: "Dil",
-		"Copy Text": "Metni Kopyala",
-		"Copied!": "Kopyalandı!",
-		Screenshot: "Ekran Alıntısı",
-		Markdown: "Markdown",
-		HTML: "HTML",
-		JSON: "JSON",
-		Archive: "Arşiv",
-		Save: "Kaydet",
-		Delete: "Sil",
-		Cancel: "İptal",
-		"Select All": "Tümünü Seç",
-		"Select...": "Toplu seçim…",
-		"Select Not Exported": "Dışa aktarılmamış konuşmaları seç",
-		"Select Updated": "Güncellenen konuşmaları seç",
-		"Shift Select Hint": "İpucu: Aralık seçmek için Shift+tık",
-		Export: "Dışa Aktar",
-		Error: "Hata",
-		Loading: "Yükleniyor",
-		Preview: "Önizleme",
-		"File Name": "Dosya Adı",
-		"Export All": "Tümünü Dışa Aktar",
-		"Exporter Settings": "Dışa Aktarma Ayarları",
-		"Export Dialog Title": "Konuşmaları Dışa Aktar",
-		"Invalid File Format": "Dosya Biçimi Geçersiz",
-		"Export from official export file": "Resmi dışa aktarma dosyasından dışa aktar",
-		"Export from API": "API'den dışa aktar",
-		"Available variables": "Kullanılabilir değişkenler",
-		"Conversation Timestamp": "Konuşma zaman bilgisi",
-		"Conversation Timestamp Description": "Sayfada gösterilir.",
-		"Enable on HTML": "HTML dosyalarında etkinleştir",
-		"Enable on Markdown": "Markdown dosyalarında etkinleştir",
-		"Use 24-hour format": "24 saat biçimini kullan (örn. 23:59)",
-		"Export Format": "Dışa Aktarma Formatı",
-		"Export Metadata": "Üst veriyi dışa aktar",
-		"Export Metadata Description": "Dışa aktarılan Markdown ve HTML dosyalarına üst veri ekle",
-		"Export Thinking Process": "Düşünme Sürecini Dışa Aktar",
-		"Export Thinking Process Description": "Dışa aktarılan Markdown ve HTML dosyalarına modelin düşünme/akıl yürütme sürecini dahil et.",
-		"Export Sources": "Kaynakları Dışa Aktar",
-		"Export Sources Description": "Her yanıtın sonunda gösterilen kaynak listesini dışa aktarılan Markdown ve HTML dosyalarına dahil et.",
-		Images: "Görseller",
-		"Images Description": "Markdown ve JSON (ZIP) dışa aktarımlarında görsellerin nasıl kaydedileceği. Görseller çıkarıldığında Markdown yerine [image] gösterir. HTML görselleri her zaman gömer.",
-		"Images Embed": "Dosyaya göm (base64)",
-		"Images Omit": "Görselleri çıkar",
-		"Images Files": "Ayrı dosyalar olarak kaydet (.zip)",
-		Sources: "Kaynaklar",
-		"OpenAI Official Format": "OpenAI Resmi Format",
-		"Conversation Archive Alert": "Seçilen tüm konuşmaları arşivlemek istediğinizden emin misiniz?",
-		"Conversation Archived Message": "Seçilen tüm konuşmalar arşivlendi. Değişiklikleri görmek için sayfayı yenileyin.",
-		"Conversation Delete Alert": "Seçilen tüm konuşmaları silmek istediğinizden emin misiniz?",
-		"Conversation Deleted Message": "Seçilen tüm konuşmalar silindi. Değişiklikleri görmek için sayfayı yenileyin.",
-		"Please start a conversation first": "Lütfen önce bir konuşma başlatın.",
-		"Temporary chat could not be captured": "Bu geçici sohbet okunamadı. Dışa aktarıcı yüklenmeden önce başlamış olabilir. Yine de PNG ekran görüntüsü olarak dışa aktarabilirsiniz.",
-		"Select Project": "Proje Seç",
-		"(no project)": "(proje yok)",
-		"Export All Limit": "Tümünü Dışa Aktarma Limiti",
-		"Export All Limit Description": "'Tümünü Dışa Aktar' iletişim kutusunda yüklenecek maksimum konuşma sayısını ayarlayın.",
-		"Select a source to load conversations": "Konuşmaları yüklemek için yukarıdan bir proje seçin.",
-		Search: "Ara",
-		"No results": "Sonuç yok",
-		"Batch progress": "Grup {{current}}/{{total}}",
-		"All conversations": "Tüm konuşmalar",
-		"Load more conversations": "{{n}} tane daha yükle",
-		"Load more conversations remaining": "{{n}} tane daha yükle · {{remaining}} kaldı",
-		"Export Skipped Message": "{{n}} konuşma tekrar denemelere rağmen başarısız oldu ve dışa aktarımda yer almıyor:",
-		"List Rate Limited Wait": "API istek sınırına ulaşıldı · {{n}} sn bekleyip tekrar deneyin",
-		"List Rate Limited": "API istek sınırına ulaşıldı · biraz sonra tekrar deneyin",
-		"List Load Failed": "Sohbetler yüklenemedi"
-	};
-	var zh_Hans_default = {
-		title: "ChatGPT Exporter",
-		ExportHelper: "导出助手",
-		Setting: "设置",
-		Language: "语言",
-		"Copy Text": "复制文字",
-		"Copied!": "已复制!",
-		Screenshot: "截屏",
-		Markdown: "Markdown",
-		HTML: "HTML",
-		JSON: "JSON",
-		Archive: "归档",
-		Save: "保存",
-		Delete: "删除",
-		Cancel: "取消",
-		"Select All": "全选",
-		"Select...": "批量选择…",
-		"Select Not Exported": "选择未导出的对话",
-		"Select Updated": "选择有更新的对话",
-		"Shift Select Hint": "提示：Shift+点击可选择范围",
-		Export: "导出",
-		Error: "错误",
-		Loading: "加载中",
-		Preview: "预览",
-		"File Name": "文件名",
-		"Export All": "批量导出",
-		"Exporter Settings": "导出设置",
-		"Export Dialog Title": "导出对话",
-		"Invalid File Format": "无效的文件格式",
-		"Export from official export file": "从官方导出文件导出",
-		"Export from API": "从 API 导出",
-		"Available variables": "可用变量",
-		"Conversation Timestamp": "对话时间戳",
-		"Conversation Timestamp Description": "会显示在页面上。",
-		"Enable on HTML": "在 HTML 文件上启用",
-		"Enable on Markdown": "在 Markdown 文件上启用",
-		"Use 24-hour format": "使用24小时制 (例如 23:59)",
-		"Export Format": "导出格式",
-		"Export Metadata": "导出元数据",
-		"Export Metadata Description": "会添加至 Markdown 以及 HTML 导出。",
-		"Export Thinking Process": "导出思考过程",
-		"Export Thinking Process Description": "在导出的 Markdown 和 HTML 文件中包含模型的思考/推理过程。",
-		"Export Sources": "导出来源",
-		"Export Sources Description": "在导出的 Markdown 和 HTML 文件中包含每个回答末尾显示的来源列表。",
-		Images: "图片",
-		"Images Description": "Markdown 和 JSON (ZIP) 导出时图片的保存方式。省略时，Markdown 会以 [image] 代替。HTML 始终嵌入图片。",
-		"Images Embed": "嵌入文件 (base64)",
-		"Images Omit": "省略图片",
-		"Images Files": "另存为单独文件 (.zip)",
-		Sources: "来源",
-		"OpenAI Official Format": "OpenAI 官方格式",
-		"Conversation Archive Alert": "确定要归档所有选取的对话？",
-		"Conversation Archived Message": "所有所选的对话已归档。请刷新页面。",
-		"Conversation Delete Alert": "确定要删除所有选取的对话？",
-		"Conversation Deleted Message": "所有所选的对话已删除。请刷新页面。",
-		"Please start a conversation first": "请先开始对话。",
-		"Temporary chat could not be captured": "无法读取此临时聊天，它可能在导出工具加载前就已开始。你仍可以将其导出为 PNG 截图。",
-		"Select Project": "选择项目",
-		"(no project)": "（无项目）",
-		"Export All Limit": "批量导出上限",
-		"Export All Limit Description": "设置“批量导出”对话框中加载的最大对话数量。",
-		"Select a source to load conversations": "请在上方选择一个项目以加载对话。",
-		Search: "搜索",
-		"No results": "无结果",
-		"Batch progress": "第 {{current}}/{{total}} 批",
-		"All conversations": "全部对话",
-		"Load more conversations": "再加载 {{n}} 条",
-		"Load more conversations remaining": "再加载 {{n}} 条 · 剩余 {{remaining}} 条",
-		"Export Skipped Message": "有 {{n}} 个对话多次重试后仍失败，未包含在导出文件中：",
-		"List Rate Limited Wait": "请求过于频繁 · 请等待 {{n}} 秒后重试",
-		"List Rate Limited": "请求过于频繁 · 请稍后重试",
-		"List Load Failed": "无法加载对话"
-	};
-	var zh_Hant_default = {
-		title: "ChatGPT Exporter",
-		ExportHelper: "Export",
-		Setting: "設定",
-		Language: "語言",
-		"Copy Text": "複製文字",
-		"Copied!": "已複製!",
-		Screenshot: "截圖",
-		Markdown: "Markdown",
-		HTML: "HTML",
-		JSON: "JSON",
-		Archive: "封存",
-		Save: "保存",
-		Delete: "刪除",
-		Cancel: "取消",
-		"Select All": "全選",
-		"Select...": "批次選取…",
-		"Select Not Exported": "選取未匯出的對話",
-		"Select Updated": "選取有更新的對話",
-		"Shift Select Hint": "提示：Shift+點擊可選取範圍",
-		Export: "匯出",
-		Error: "錯誤",
-		Loading: "載入中",
-		Preview: "預覽",
-		"File Name": "檔案名稱",
-		"Export All": "批量匯出",
-		"Exporter Settings": "設定",
-		"Export Dialog Title": "匯出對話",
-		"Invalid File Format": "無效的檔案格式",
-		"Export from official export file": "從官方匯出檔案匯出",
-		"Export from API": "從 API 匯出",
-		"Available variables": "可用變數",
-		"Conversation Timestamp": "對話時間戳",
-		"Conversation Timestamp Description": "會顯示在頁面上。",
-		"Enable on HTML": "在 HTML 檔案上啟用",
-		"Enable on Markdown": "在 Markdown 檔案上啟用",
-		"Use 24-hour format": "使用24小時制 (例如 23:59)",
-		"Export Format": "匯出格式",
-		"Export Metadata": "匯出元資料",
-		"Export Metadata Description": "會添加至 Markdown 以及 HTML 匯出。",
-		"Export Thinking Process": "匯出思考過程",
-		"Export Thinking Process Description": "在匯出的 Markdown 和 HTML 檔案中包含模型的思考/推理過程。",
-		"Export Sources": "匯出來源",
-		"Export Sources Description": "在匯出的 Markdown 和 HTML 檔案中包含每個回答末尾顯示的來源列表。",
-		Images: "圖片",
-		"Images Description": "Markdown 和 JSON (ZIP) 匯出時圖片的儲存方式。省略時，Markdown 會以 [image] 代替。HTML 一律嵌入圖片。",
-		"Images Embed": "嵌入檔案 (base64)",
-		"Images Omit": "省略圖片",
-		"Images Files": "另存為獨立檔案 (.zip)",
-		Sources: "來源",
-		"OpenAI Official Format": "OpenAI 官方格式",
-		"Conversation Archive Alert": "確定要封存所有選取的對話？",
-		"Conversation Archived Message": "所有選取的對話已封存。請重新整理頁面。",
-		"Conversation Delete Alert": "確定要刪除所有選取的對話？",
-		"Conversation Deleted Message": "所有選取的對話已刪除。請重新整理頁面。",
-		"Please start a conversation first": "請先開始對話。",
-		"Temporary chat could not be captured": "無法讀取此暫存對話，它可能在匯出工具載入前就已開始。你仍可以將其匯出為 PNG 截圖。",
-		"Select Project": "選擇專案",
-		"(no project)": "（無專案）",
-		"Export All Limit": "批量匯出上限",
-		"Export All Limit Description": "設定「批量匯出」對話方塊中載入的最大對話數量。",
-		"Select a source to load conversations": "請在上方選擇一個專案以載入對話。",
-		Search: "搜尋",
-		"No results": "無結果",
-		"Batch progress": "第 {{current}}/{{total}} 批",
-		"All conversations": "全部對話",
-		"Load more conversations": "再載入 {{n}} 筆",
-		"Load more conversations remaining": "再載入 {{n}} 筆 · 剩餘 {{remaining}} 筆",
-		"Export Skipped Message": "有 {{n}} 個對話重試多次仍失敗，沒有包含在匯出檔中：",
-		"List Rate Limited Wait": "請求太頻繁 · 請等 {{n}} 秒後再試",
-		"List Rate Limited": "請求太頻繁 · 請稍後再試",
-		"List Load Failed": "無法載入對話"
-	};
-	var GMStorage = class {
-		static supported = typeof _GM_getValue === "function" && typeof _GM_setValue === "function" && typeof _GM_deleteValue === "function";
-		static get(key) {
-			const item = _GM_getValue(key, "");
-			if (item) try {
-				return JSON.parse(item);
-			} catch {
-				return null;
-			}
-			return null;
-		}
-		static set(key, value) {
-			_GM_setValue(key, JSON.stringify(value));
-		}
-		static delete(key) {
-			_GM_deleteValue(key);
-		}
-	};
-	var LocalStorage = class {
-		static supported = typeof localStorage === "object";
-		static get(key) {
-			const item = localStorage.getItem(key);
-			if (item) try {
-				return JSON.parse(item);
-			} catch {
-				return null;
-			}
-			return null;
-		}
-		static set(key, value) {
-			const item = JSON.stringify(value);
-			localStorage.setItem(key, item);
-		}
-		static delete(key) {
-			localStorage.removeItem(key);
-		}
-	};
-	var MemoryStorage = class {
-		static map = new Map();
-		static supported = true;
-		static get(key) {
-			const item = this.map.get(key);
-			if (!item) return null;
-			return item;
-		}
-		static set(key, value) {
-			this.map.set(key, value);
-		}
-		static delete(key) {
-			this.map.delete(key);
-		}
-	};
-	var ScriptStorage = class {
-		static get(key) {
-			if (GMStorage.supported) try {
-				return GMStorage.get(key);
-			} catch {}
-			if (LocalStorage.supported) try {
-				return LocalStorage.get(key);
-			} catch {}
-			return MemoryStorage.get(key);
-		}
-		static set(key, value) {
-			if (GMStorage.supported) try {
-				return GMStorage.set(key, value);
-			} catch {}
-			if (LocalStorage.supported) try {
-				return LocalStorage.set(key, value);
-			} catch {}
-			return MemoryStorage.set(key, value);
-		}
-		static delete(key) {
-			if (GMStorage.supported) try {
-				return GMStorage.delete(key);
-			} catch {}
-			if (LocalStorage.supported) try {
-				return LocalStorage.delete(key);
-			} catch {}
-			return MemoryStorage.delete(key);
-		}
-	};
-	var EN_US = {
-		name: "English",
-		code: "en-US",
-		resource: en_default
-	};
-	var ES = {
-		name: "Español",
-		code: "es",
-		resource: es_default
-	};
-	var FR = {
-		name: "Français",
-		code: "fr",
-		resource: fr_default
-	};
-	var ID_ID = {
-		name: "Indonesia",
-		code: "id-ID",
-		resource: id_default
-	};
-	var JA_JP = {
-		name: "日本語",
-		code: "ja-JP",
-		resource: jp_default
-	};
-	var RU = {
-		name: "Русский",
-		code: "ru",
-		resource: ru_default
-	};
-	var TR_TR = {
-		name: "Türkçe",
-		code: "tr-TR",
-		resource: tr_default
-	};
-	var ZH_Hans = {
-		name: "简体中文",
-		code: "zh-Hans",
-		resource: zh_Hans_default
-	};
-	var ZH_Hant = {
-		name: "繁體中文",
-		code: "zh-Hant",
-		resource: zh_Hant_default
-	};
-	var LOCALES = [
-		EN_US,
-		ES,
-		FR,
-		ID_ID,
-		JA_JP,
-		RU,
-		TR_TR,
-		ZH_Hans,
-		ZH_Hant
-	];
-	var LanguageMapping = {
-		"en": EN_US.code,
-		"en-US": EN_US.code,
-		"es": ES.code,
-		"es-ES": ES.code,
-		"es-AR": ES.code,
-		"es-CL": ES.code,
-		"es-CO": ES.code,
-		"es-MX": ES.code,
-		"es-US": ES.code,
-		"fr": FR.code,
-		"fr-FR": FR.code,
-		"id": ID_ID.code,
-		"id-ID": ID_ID.code,
-		"ja": JA_JP.code,
-		"ja-JP": JA_JP.code,
-		"ru": RU.code,
-		"ru-RU": RU.code,
-		"tr": TR_TR.code,
-		"tr-TR": TR_TR.code,
-		"zh": ZH_Hans.code,
-		"zh-CN": ZH_Hans.code,
-		"zh-MO": ZH_Hans.code,
-		"zh-SG": ZH_Hans.code,
-		"zh-Hans": ZH_Hans.code,
-		"zh-HK": ZH_Hant.code,
-		"zh-TW": ZH_Hant.code,
-		"zh-Hant": ZH_Hant.code
-	};
-	var resources = LOCALES.reduce((acc, cur) => {
-		acc[cur.code] = cur.resource;
-		return acc;
-	}, {});
-	function standardizeLanguage(language) {
-		if (!language) return null;
-		if (language in LanguageMapping) return LanguageMapping[language];
-		const shortLang = language.split("-")[0];
-		if (shortLang in LanguageMapping) return LanguageMapping[shortLang];
-		return null;
-	}
-	function getNavigatorLanguage() {
-		const { language, languages } = navigator;
-		if (language) return language;
-		if (languages && languages.length) return languages[0];
-		return null;
-	}
-	function getOaiLanguage() {
-		return (window?.localStorage?.getItem("oai/apps/locale"))?.replace(/^"(.*)"$/, "$1") ?? null;
-	}
-	function getDefaultLanguage() {
-		const storedLanguage = ScriptStorage.get(KEY_LANGUAGE);
-		const oaiLanguage = getOaiLanguage();
-		const browserLanguage = getNavigatorLanguage();
-		return standardizeLanguage(storedLanguage) ?? standardizeLanguage(oaiLanguage) ?? standardizeLanguage(browserLanguage) ?? EN_US.code;
-	}
-	var language = getDefaultLanguage();
-	var listeners = new Set();
-	function t(key, options) {
-		const template = resources[language]?.[key] ?? resources[EN_US.code][key] ?? key;
-		if (!options) return template;
-		return template.replace(/\{\{\s*(\w+)\s*\}\}/g, (_, name) => String(options[name] ?? ""));
-	}
-	function changeLanguage(lng) {
-		if (lng === language) return;
-		language = lng;
-		ScriptStorage.set(KEY_LANGUAGE, lng);
-		listeners.forEach((listener) => listener());
-	}
-	function subscribe$2(listener) {
-		listeners.add(listener);
-		return () => listeners.delete(listener);
-	}
-	var i18n = {
-		t,
-		changeLanguage,
-		get language() {
-			return language;
-		}
-	};
-	var translators = new Map();
-	function getTranslator(lng) {
-		let translator = translators.get(lng);
-		if (!translator) {
-			translator = (key, options) => t(key, options);
-			translators.set(lng, translator);
-		}
-		return translator;
-	}
-	function useTranslation() {
-		return {
-			t: getTranslator(En(subscribe$2, () => language)),
-			i18n
-		};
-	}
-	var template_default = "<!DOCTYPE html>\n<html lang=\"{{lang}}\" data-theme=\"{{theme}}\">\n<head>\n    <meta charset=\"UTF-8\" />\n    <link rel=\"icon\" href=\"https://chat.openai.com/favicon.ico\" />\n    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />\n    <title>{{title}}</title>\n    <link rel=\"stylesheet\" href=\"https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github-dark.min.css\">\n    <script src=\"https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js\"><\/script>\n    <script>\n        hljs.highlightAll()\n    <\/script>\n    <link rel=\"stylesheet\" href=\"https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.3/katex.min.css\">\n    <script src=\"https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.3/katex.min.js\"><\/script>\n    <script src=\"https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.3/contrib/auto-render.min.js\"><\/script>\n    <script>\n        document.addEventListener(\"DOMContentLoaded\", function() {\n            renderMathInElement(document.body, {\n                delimiters: [\n                    { left: \"\\\\[\", right: \"\\\\]\", display: true },\n                    { left: \"\\\\(\", right: \"\\\\)\", display: false }\n                ],\n                throwOnError: false,\n                ignoredClasses: [\"no-katex\"]\n            });\n        });\n    <\/script>\n\n    <style>\n        :root {\n            --page-text: #0d0d0d;\n            --page-bg: #fff;\n            --td-borders: #374151;\n            --th-borders: #4b5563;\n            --tw-prose-code: var(--page-text);\n            --tw-prose-counters: #9b9b9b;\n            --tw-prose-headings: var(--page-text);\n            --tw-prose-hr: rgba(0,0,0,.25);\n            --tw-prose-links: var(--page-text);\n            --tw-prose-quotes: var(--page-text);\n            --meta-title: #616c77;\n        }\n\n        [data-theme=\"dark\"] {\n            --page-text: #ececec;\n            --page-bg: #212121;\n            --tw-prose-code: var(--page-text);\n            --tw-prose-counters: #9b9b9b;\n            --tw-prose-headings: var(--page-text);\n            --tw-prose-hr: hsla(0,0%,100%,.25);\n            --tw-prose-links: var(--page-text);\n            --tw-prose-quotes: var(--page-text);\n            --meta-title: #959faa;\n        }\n\n        * {\n            box-sizing: border-box;\n            font-size: 16px;\n        }\n\n        ::-webkit-scrollbar {\n            height: 1rem;\n            width: .5rem\n        }\n\n        ::-webkit-scrollbar:horizontal {\n            height: .5rem;\n            width: 1rem\n        }\n\n        ::-webkit-scrollbar-track {\n            background-color: transparent;\n            border-radius: 9999px\n        }\n\n        ::-webkit-scrollbar-thumb {\n            --tw-border-opacity: 1;\n            background-color: rgba(217,217,227,.8);\n            border-color: rgba(255,255,255,var(--tw-border-opacity));\n            border-radius: 9999px;\n            border-width: 1px\n        }\n\n        ::-webkit-scrollbar-thumb:hover {\n            --tw-bg-opacity: 1;\n            background-color: rgba(236,236,241,var(--tw-bg-opacity))\n        }\n\n        [data-theme=\"dark\"] ::-webkit-scrollbar-thumb {\n            --tw-bg-opacity: 1;\n            background-color: rgba(86,88,105,var(--tw-bg-opacity))\n        }\n\n        [data-theme=\"dark\"] ::-webkit-scrollbar-thumb:hover {\n            --tw-bg-opacity: 1;\n            background-color: rgba(172,172,190,var(--tw-bg-opacity))\n        }\n\n        @media (min-width: 768px) {\n            .scrollbar-trigger ::-webkit-scrollbar-thumb {\n                visibility:hidden\n            }\n\n            .scrollbar-trigger:hover ::-webkit-scrollbar-thumb {\n                visibility: visible\n            }\n        }\n\n        body {\n            font-family: Söhne,ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,sans-serif,Helvetica Neue,Arial,Apple Color Emoji,Segoe UI Emoji,Segoe UI Symbol,Noto Color Emoji;\n            font-size: 14px;\n            line-height: 1.5;\n            color: var(--page-text);\n            background-color: var(--page-bg);\n            margin: 0;\n            padding: 0;\n        }\n\n        [data-theme=\"light\"] .sun {\n            display: none;\n        }\n\n        [data-theme=\"dark\"] .moon {\n            display: none;\n        }\n\n        .toggle {\n            display: inline-flex;\n            justify-content: center;\n            align-items: center;\n            width: 32px;\n            height: 32px;\n            border-radius: 4px;\n            background-color: #fff;\n            border: 1px solid #e2e8f0;\n        }\n\n        [data-width=\"narrow\"] .width-toggle .expand {\n            display: block;\n        }\n\n        [data-width=\"wide\"] .width-toggle .narrow {\n            display: block;\n        }\n\n        .width-toggle {\n            display: inline-flex;\n            justify-content: center;\n            align-items: center;\n            width: 32px;\n            height: 32px;\n            border-radius: 4px;\n            background-color: #fff;\n            border: 1px solid #e2e8f0;\n            margin-left: 8px;\n            cursor: pointer;\n        }\n\n        .width-toggle svg {\n            display: none;\n        }\n\n        .metadata_container {\n            display: flex;\n            flex-direction: column;\n            margin-top: 8px;\n            padding-left: 1rem;\n        }\n\n        .metadata_item {\n            display: flex;\n            flex-direction: row;\n            align-items: center;\n            border-radius: 16px;\n            padding: 4px 0.5rem;\n        }\n\n        .metadata_item:hover {\n            background-color: rgba(0,0,0,.1);\n        }\n\n        .metadata_item > div:first-child {\n            flex: 0 1 100px;\n            color: var(--meta-title);\n        }\n\n        .metadata_item > div:last-child {\n            flex: 1;\n        }\n\n        a {\n            color: var(--tw-prose-links);\n            font-size: 0.8rem;\n            text-decoration-line: underline;\n            text-underline-offset: 2px;\n        }\n\n        .conversation-content > p:first-child,\n        ol:first-child {\n            margin-top: 0;\n        }\n\n        :not(pre)>code {\n            color: var(--tw-prose-code);\n            font-family: ui-monospace, SFMono-Regular, \"SF Mono\", Menlo, Consolas, monospace;\n            font-size: .92em;\n            background-color: rgba(0, 0, 0, .09);\n            border-radius: 6px;\n            padding: 1px 6px;\n        }\n\n        [data-theme=\"dark\"] :not(pre)>code {\n            background-color: rgba(255, 255, 255, .1);\n        }\n\n        hr {\n            width: 100%;\n            height: 0;\n            border: 1px solid var(--tw-prose-hr);\n            margin-bottom: 1em;\n            margin-top: 1em;\n        }\n\n        pre {\n            color: #ffffff;\n            background-color: #000000;\n            overflow-x: auto;\n            margin: 0 0 1rem 0;\n            padding: 1rem;\n            border-radius: 0.375rem;\n        }\n\n        /* The highlight.js theme pads and colors `code.hljs`, but only for languages it knows */\n        pre>code.hljs {\n            padding: 0;\n            background: none;\n        }\n\n        pre>code {\n            font-family: Söhne Mono, Monaco, Andale Mono, Ubuntu Mono, monospace !important;\n            font-weight: 400;\n            font-size: .875em;\n            line-height: 1.7142857;\n        }\n\n        h1, h2, h3, h4, h5, h6 {\n            color: var(--tw-prose-headings);\n            margin: 0;\n        }\n\n        h1 {\n            font-size: 2.25em;\n            font-weight: 600;\n            line-height: 1.1111111;\n            margin-bottom: 0.8888889em;\n            margin-top: 0;\n        }\n\n        h2 {\n            font-size: 1.5em;\n            font-weight: 700;\n            line-height: 1.3333333;\n            margin-bottom: 1em;\n            margin-top: 2em;\n        }\n\n        h3 {\n            font-size: 1.25em;\n            font-weight: 600;\n            line-height: 1.6;\n            margin-bottom: .6em;\n            margin-top: 1.6em;\n        }\n\n        h4 {\n            font-weight: 400;\n            line-height: 1.5;\n            margin-bottom: .5em;\n            margin-top: 1.5em\n        }\n\n        h3,h4 {\n            margin-bottom: .5rem;\n            margin-top: 1rem;\n        }\n\n        h5 {\n            font-weight: 600;\n        }\n\n        blockquote {\n            border-left: 2px solid rgba(142,142,160,1);\n            color: var(--tw-prose-quotes);\n            font-style: italic;\n            font-style: normal;\n            font-weight: 500;\n            line-height: 1rem;\n            margin: 1.6em 0;\n            padding-left: 1em;\n            quotes: \"\\201C\"\"\\201D\"\"\\2018\"\"\\2019\";\n        }\n\n        blockquote p:first-of-type:before {\n            content: open-quote;\n        }\n\n        blockquote p:last-of-type:after {\n            content: close-quote;\n        }\n\n        ol, ul {\n            padding-left: 1.1rem;\n        }\n\n        ::marker {\n            color: var(--tw-prose-counters);\n            font-weight: 400;\n        }\n\n        table {\n            width: 100%;\n            border-collapse: separate;\n            border-spacing: 0 0;\n            table-layout: auto;\n            text-align: left;\n            font-size: .875em;\n            line-height: 1.7142857;\n        }\n\n        table * {\n            box-sizing: border-box;\n            border-width: 0;\n            border-style: solid;\n            border-color: #d9d9e3;\n        }\n\n        table thead {\n            border-bottom-color: var(--th-borders);\n            border-bottom-width: 1px;\n        }\n\n        table th {\n            background-color: rgba(236,236,241,.2);\n            border-bottom-width: 1px;\n            border-left-width: 1px;\n            border-top-width: 1px;\n            padding: 0.25rem 0.75rem;\n        }\n\n        table th:first-child {\n            border-top-left-radius: 0.375rem;\n        }\n\n        table th:last-child {\n            border-right-width: 1px;\n            border-top-right-radius: 0.375rem;\n        }\n\n        table tbody tr {\n            border-bottom-color: var(--td-borders);\n            border-bottom-width: 1px;\n        }\n\n        table tbody tr:last-child {\n            border-bottom-width: 0;\n        }\n\n        table tbody tr:last-child td:first-child {\n            border-bottom-left-radius: 0.375rem;\n        }\n\n        table tbody tr:last-child td:last-child {\n            border-bottom-right-radius: 0.375rem;\n        }\n\n        table td {\n            border-bottom-width: 1px;\n            border-left-width: 1px;\n            padding: 0.25rem 0.75rem;\n        }\n\n        table td:last-child {\n            border-right-width: 1px;\n        }\n\n        [type=checkbox], [type=radio] {\n            accent-color: #2563eb;\n        }\n\n        .conversation {\n            margin: 0 auto;\n            padding: 1rem;\n            max-width: 64rem;\n        }\n\n        [data-width=\"narrow\"] .conversation {\n            max-width: 64rem;\n        }\n\n        [data-width=\"wide\"] .conversation {\n            max-width: 90%;\n        }\n\n        @media (min-width: 1280px) {\n            .conversation {\n                max-width: 48rem;\n            }\n        }\n\n        @media (min-width: 1024px) {\n            .conversation {\n                max-width: 40rem;\n            }\n        }\n\n        @media (min-width: 768px) {\n            .conversation {\n                max-width: 48rem;\n            }\n        }\n\n        .conversation-header {\n            margin-bottom: 1rem;\n        }\n\n        .conversation-header h1 {\n            margin: 0;\n        }\n\n        .conversation-header h1 a {\n            font-size: 1.5rem;\n        }\n\n        .conversation-header .conversation-export {\n            margin-top: 0.5rem;\n            font-size: 0.8rem;\n        }\n\n        .conversation-header p {\n            margin-top: 0.5rem;\n            font-size: 0.8rem;\n        }\n\n        .conversation-item {\n            display: flex;\n            position: relative;\n            padding: 1rem;\n            border-left: 1px solid rgba(0,0,0,.1);\n            border-right: 1px solid rgba(0,0,0,.1);\n            border-bottom: 1px solid rgba(0,0,0,.1);\n        }\n\n        .conversation-item:first-of-type {\n            border-top: 1px solid rgba(0,0,0,.1);\n        }\n\n        .author {\n            display: flex;\n            flex: 0 0 30px;\n            justify-content: center;\n            align-items: center;\n            width: 30px;\n            height: 30px;\n            border-radius: 0.125rem;\n            margin-right: 1rem;\n            overflow: hidden;\n        }\n\n        .author svg {\n            color: #fff;\n            width: 22px;\n            height: 22px;\n        }\n\n        .author img {\n            content: url({{avatar}});\n            width: 100%;\n            height: 100%;\n        }\n\n        .author.assistant {\n            background-color: rgb(16, 163, 127);\n        }\n\n        .conversation-content-wrapper {\n            display: flex;\n            position: relative;\n            overflow: hidden;\n            flex: 1 1 auto;\n            flex-direction: column;\n        }\n\n        .thinking {\n            font-size: 0.875rem;\n            line-height: 1.5;\n            margin-bottom: 0.75rem;\n            border: 1px solid #d1d5db;\n            border-radius: 0.5rem;\n            padding: 0.5rem 0.75rem;\n        }\n\n        .thinking summary {\n            cursor: pointer;\n            font-weight: 500;\n            color: #6b7280;\n        }\n\n        .thinking p {\n            margin: 0.5rem 0;\n            color: #6b7280;\n        }\n\n        [data-theme=\"dark\"] .thinking {\n            border-color: #4b5563;\n        }\n\n        [data-theme=\"dark\"] .thinking summary,\n        [data-theme=\"dark\"] .thinking p {\n            color: #9ca3af;\n        }\n\n        .conversation-content {\n            font-size: 1rem;\n            line-height: 1.5;\n        }\n\n        .conversation-content p {\n            white-space: pre-wrap;\n            line-height: 28px;\n        }\n\n        .conversation-content img, .conversation-content video {\n            display: block;\n            max-width: 100%;\n            height: auto;\n            margin-bottom: 2em;\n            margin-top: 2em;\n        }\n\n        .attachments {\n            list-style: none;\n            margin: 0.5rem 0 0;\n            padding: 0;\n            font-size: 0.875rem;\n            color: #6b7280;\n        }\n\n        [data-theme=\"dark\"] .attachments {\n            color: #9ca3af;\n        }\n\n        .time {\n            position: absolute;\n            right: 8px;\n            bottom: 0;\n            font-size: 0.8rem;\n            color: #acacbe\n        }\n\n    </style>\n</head>\n\n<body>\n    <svg aria-hidden=\"true\" style=\"position: absolute; width: 0; height: 0; overflow: hidden;\" version=\"1.1\" xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\">\n        <symbol id=\"chatgpt\" viewBox=\"0 0 41 41\">\n            <path d=\"M37.5324 16.8707C37.9808 15.5241 38.1363 14.0974 37.9886 12.6859C37.8409 11.2744 37.3934 9.91076 36.676 8.68622C35.6126 6.83404 33.9882 5.3676 32.0373 4.4985C30.0864 3.62941 27.9098 3.40259 25.8215 3.85078C24.8796 2.7893 23.7219 1.94125 22.4257 1.36341C21.1295 0.785575 19.7249 0.491269 18.3058 0.500197C16.1708 0.495044 14.0893 1.16803 12.3614 2.42214C10.6335 3.67624 9.34853 5.44666 8.6917 7.47815C7.30085 7.76286 5.98686 8.3414 4.8377 9.17505C3.68854 10.0087 2.73073 11.0782 2.02839 12.312C0.956464 14.1591 0.498905 16.2988 0.721698 18.4228C0.944492 20.5467 1.83612 22.5449 3.268 24.1293C2.81966 25.4759 2.66413 26.9026 2.81182 28.3141C2.95951 29.7256 3.40701 31.0892 4.12437 32.3138C5.18791 34.1659 6.8123 35.6322 8.76321 36.5013C10.7141 37.3704 12.8907 37.5973 14.9789 37.1492C15.9208 38.2107 17.0786 39.0587 18.3747 39.6366C19.6709 40.2144 21.0755 40.5087 22.4946 40.4998C24.6307 40.5054 26.7133 39.8321 28.4418 38.5772C30.1704 37.3223 31.4556 35.5506 32.1119 33.5179C33.5027 33.2332 34.8167 32.6547 35.9659 31.821C37.115 30.9874 38.0728 29.9178 38.7752 28.684C39.8458 26.8371 40.3023 24.6979 40.0789 22.5748C39.8556 20.4517 38.9639 18.4544 37.5324 16.8707ZM22.4978 37.8849C20.7443 37.8874 19.0459 37.2733 17.6994 36.1501C17.7601 36.117 17.8666 36.0586 17.936 36.0161L25.9004 31.4156C26.1003 31.3019 26.2663 31.137 26.3813 30.9378C26.4964 30.7386 26.5563 30.5124 26.5549 30.2825V19.0542L29.9213 20.998C29.9389 21.0068 29.9541 21.0198 29.9656 21.0359C29.977 21.052 29.9842 21.0707 29.9867 21.0902V30.3889C29.9842 32.375 29.1946 34.2791 27.7909 35.6841C26.3872 37.0892 24.4838 37.8806 22.4978 37.8849ZM6.39227 31.0064C5.51397 29.4888 5.19742 27.7107 5.49804 25.9832C5.55718 26.0187 5.66048 26.0818 5.73461 26.1244L13.699 30.7248C13.8975 30.8408 14.1233 30.902 14.3532 30.902C14.583 30.902 14.8088 30.8408 15.0073 30.7248L24.731 25.1103V28.9979C24.7321 29.0177 24.7283 29.0376 24.7199 29.0556C24.7115 29.0736 24.6988 29.0893 24.6829 29.1012L16.6317 33.7497C14.9096 34.7416 12.8643 35.0097 10.9447 34.4954C9.02506 33.9811 7.38785 32.7263 6.39227 31.0064ZM4.29707 13.6194C5.17156 12.0998 6.55279 10.9364 8.19885 10.3327C8.19885 10.4013 8.19491 10.5228 8.19491 10.6071V19.808C8.19351 20.0378 8.25334 20.2638 8.36823 20.4629C8.48312 20.6619 8.64893 20.8267 8.84863 20.9404L18.5723 26.5542L15.206 28.4979C15.1894 28.5089 15.1703 28.5155 15.1505 28.5173C15.1307 28.5191 15.1107 28.516 15.0924 28.5082L7.04046 23.8557C5.32135 22.8601 4.06716 21.2235 3.55289 19.3046C3.03862 17.3858 3.30624 15.3413 4.29707 13.6194ZM31.955 20.0556L22.2312 14.4411L25.5976 12.4981C25.6142 12.4872 25.6333 12.4805 25.6531 12.4787C25.6729 12.4769 25.6928 12.4801 25.7111 12.4879L33.7631 17.1364C34.9967 17.849 36.0017 18.8982 36.6606 20.1613C37.3194 21.4244 37.6047 22.849 37.4832 24.2684C37.3617 25.6878 36.8382 27.0432 35.9743 28.1759C35.1103 29.3086 33.9415 30.1717 32.6047 30.6641C32.6047 30.5947 32.6047 30.4733 32.6047 30.3889V21.188C32.6066 20.9586 32.5474 20.7328 32.4332 20.5338C32.319 20.3348 32.154 20.1698 31.955 20.0556ZM35.3055 15.0128C35.2464 14.9765 35.1431 14.9142 35.069 14.8717L27.1045 10.2712C26.906 10.1554 26.6803 10.0943 26.4504 10.0943C26.2206 10.0943 25.9948 10.1554 25.7963 10.2712L16.0726 15.8858V11.9982C16.0715 11.9783 16.0753 11.9585 16.0837 11.9405C16.0921 11.9225 16.1048 11.9068 16.1207 11.8949L24.1719 7.25025C25.4053 6.53903 26.8158 6.19376 28.2383 6.25482C29.6608 6.31589 31.0364 6.78077 32.2044 7.59508C33.3723 8.40939 34.2842 9.53945 34.8334 10.8531C35.3826 12.1667 35.5464 13.6095 35.3055 15.0128ZM14.2424 21.9419L10.8752 19.9981C10.8576 19.9893 10.8423 19.9763 10.8309 19.9602C10.8195 19.9441 10.8122 19.9254 10.8098 19.9058V10.6071C10.8107 9.18295 11.2173 7.78848 11.9819 6.58696C12.7466 5.38544 13.8377 4.42659 15.1275 3.82264C16.4173 3.21869 17.8524 2.99464 19.2649 3.1767C20.6775 3.35876 22.0089 3.93941 23.1034 4.85067C23.0427 4.88379 22.937 4.94215 22.8668 4.98473L14.9024 9.58517C14.7025 9.69878 14.5366 9.86356 14.4215 10.0626C14.3065 10.2616 14.2466 10.4877 14.2479 10.7175L14.2424 21.9419ZM16.071 17.9991L20.4018 15.4978L24.7325 17.9975V22.9985L20.4018 25.4983L16.071 22.9985V17.9991Z\" fill=\"currentColor\"></path>\n        </symbol>\n    </svg>\n    <div class=\"conversation\">\n        <div class=\"conversation-header\">\n            <h1>\n                <a href=\"{{source}}\" target=\"_blank\" rel=\"noopener noreferrer\">{{title}}</a>\n                <button class=\"toggle\">\n                    <svg class=\"sun\" stroke=\"currentColor\" fill=\"none\" stroke-width=\"2\" viewBox=\"0 0 24 24\" stroke-linecap=\"round\" stroke-linejoin=\"round\" class=\"w-4 h-4\" height=\"1em\" width=\"1em\" xmlns=\"http://www.w3.org/2000/svg\"><circle cx=\"12\" cy=\"12\" r=\"5\"></circle><line x1=\"12\" y1=\"1\" x2=\"12\" y2=\"3\"></line><line x1=\"12\" y1=\"21\" x2=\"12\" y2=\"23\"></line><line x1=\"4.22\" y1=\"4.22\" x2=\"5.64\" y2=\"5.64\"></line><line x1=\"18.36\" y1=\"18.36\" x2=\"19.78\" y2=\"19.78\"></line><line x1=\"1\" y1=\"12\" x2=\"3\" y2=\"12\"></line><line x1=\"21\" y1=\"12\" x2=\"23\" y2=\"12\"></line><line x1=\"4.22\" y1=\"19.78\" x2=\"5.64\" y2=\"18.36\"></line><line x1=\"18.36\" y1=\"5.64\" x2=\"19.78\" y2=\"4.22\"></line></svg>\n                    <svg class=\"moon\" stroke=\"currentColor\" fill=\"none\" stroke-width=\"2\" viewBox=\"0 0 24 24\" stroke-linecap=\"round\" stroke-linejoin=\"round\" class=\"w-4 h-4\" height=\"1em\" width=\"1em\" xmlns=\"http://www.w3.org/2000/svg\"><path d=\"M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z\"></path></svg>\n                </button>\n                <button class=\"toggle width-toggle\">\n                    <svg class=\"expand\" stroke=\"currentColor\" fill=\"none\" stroke-width=\"2\" viewBox=\"0 0 24 24\" stroke-linecap=\"round\" stroke-linejoin=\"round\" class=\"w-4 h-4\" height=\"1em\" width=\"1em\" xmlns=\"http://www.w3.org/2000/svg\" style=\"display: block;\">\n                        <path d=\"M3 12h18M6 8l-4 4 4 4M18 8l4 4-4 4\"></path>\n                    </svg>\n                    <svg class=\"narrow\" stroke=\"currentColor\" fill=\"none\" stroke-width=\"2\" viewBox=\"0 0 24 24\" stroke-linecap=\"round\" stroke-linejoin=\"round\" class=\"w-4 h-4\" height=\"1em\" width=\"1em\" xmlns=\"http://www.w3.org/2000/svg\" style=\"display: none;\">\n                        <path d=\"M3 12h7M14 12h7M6 16l4-4-4-4M18 16l-4-4 4-4\"></path>\n                    </svg>\n                </button>\n            </h1>\n            <div class=\"conversation-export\">\n                <p>Exported by\n                <a href=\"https://github.com/pionxzh/chatgpt-exporter.git\">ChatGPT Exporter</a>\n                at {{time}}</p>\n            </div>\n            {{details}}\n        </div>\n\n        {{content}}\n    </div>\n\n\n    <script>\n        function toggleDarkMode(mode) {\n            const html = document.querySelector('html');\n            const isDarkMode = html.getAttribute('data-theme') === 'dark';\n            const newMode = mode || (isDarkMode ? 'light' : 'dark');\n            if (newMode !== 'dark' && newMode !== 'light') return;\n            html.setAttribute('data-theme', newMode);\n\n            const url = new URL(window.location);\n            url.searchParams.set('theme', newMode);\n            window.history.replaceState({}, '', url);\n        }\n        function toggleWidthMode(mode) {\n            const body = document.querySelector('body');\n            const widthToggleButton = document.querySelector('.width-toggle');\n            const isWide = body.getAttribute('data-width') === 'wide';\n            const newWidthMode = mode || (isWide ? 'narrow' : 'wide');\n            if (newWidthMode !== 'narrow' && newWidthMode !== 'wide') return;\n            body.setAttribute('data-width', newWidthMode);\n\n            const url = new URL(window.location);\n            url.searchParams.set('width', newWidthMode);\n            window.history.replaceState({}, '', url);\n\n            // Update the icon based on the current mode\n            const narrowIcon = widthToggleButton.querySelector('.narrow');\n            const expandIcon = widthToggleButton.querySelector('.expand');\n\n            if (newWidthMode === 'wide') {\n                expandIcon.style.display = \"none\";\n                narrowIcon.style.display = \"block\";\n            } else {\n                expandIcon.style.display = \"block\";\n                narrowIcon.style.display = \"none\";\n            }\n        }\n\n        const urlParams = new URLSearchParams(window.location.search);\n        const theme = urlParams.get('theme');\n        const width = urlParams.get('width');\n\n        if (theme) toggleDarkMode(theme);\n        if (width) toggleWidthMode(width);\n\n        document.querySelector('.toggle').addEventListener('click', () => toggleDarkMode());\n        document.querySelector('.width-toggle').addEventListener('click', () => toggleWidthMode());\n    <\/script>\n</body>\n\n</html>\n";
-	var CitationMarkerRegex = /\uE200cite(?:\uE202[^\uE200\uE201]*)+\uE201/gu;
-	function normalizeCitationText(input) {
-		return input.replaceAll(/[\u00A0\u202F\u2007\u2060]/gu, " ").replaceAll(/[\u2010-\u2015\u2212]/gu, "-").replaceAll(/[\uE203\uE204]/gu, "");
-	}
-	function transformContentReferences(input, metadata, options = {}) {
-		const outputType = options.output ?? "markdown";
-		const inlineReferenceMode = options.inlineReferenceMode ?? "expanded";
-		const contentRefs = metadata?.content_references ?? [];
-		let output = normalizeCitationText(input);
-		const sortedRefs = [...contentRefs].filter((ref) => ref.type !== "sources_footnote").sort((a, b) => (b.matched_text?.length || 0) - (a.matched_text?.length || 0));
-		const fileReplacements = new Set();
-		for (const ref of sortedRefs) {
-			if (!ref.matched_text) continue;
-			if (ref.type === "client_defined_widget" && ref.data?.widget_type === "code_block") continue;
-			const matchedText = normalizeCitationText(ref.matched_text);
-			if (!matchedText) continue;
-			const replacement = formatInlineReference(ref, outputType, inlineReferenceMode);
-			output = output.replaceAll(matchedText, () => replacement);
-			if (ref.type === "file" && replacement) fileReplacements.add(replacement);
-		}
-		for (const replacement of fileReplacements) {
-			const escaped = escapeRegExp(replacement);
-			output = output.replaceAll(new RegExp(`${escaped}(?:\\s*${escaped})+`, "g"), () => replacement);
-		}
-		output = output.replace(CitationMarkerRegex, "");
-		if (options.includeSourceList !== false) {
-			const sources = getSourcesFootnoteSources(contentRefs);
-			if (sources.length > 0) output = appendSourcesSection(output, sources, outputType, options.sourceListLabel ?? "Sources");
-		}
-		return output;
-	}
-	function formatCitationSource(source, output) {
-		const label = getSourceLabel(source);
-		const url = source.url?.trim();
-		if (!url) return output === "markdown" ? escapeMarkdownText(label) : label;
-		if (output === "text") return `${label}: ${url}`;
-		return `[${escapeMarkdownText(label)}](<${escapeMarkdownUrl(url)}>)`;
-	}
-	function formatInlineReference(ref, output, mode) {
-		if (ref.type === "client_defined_widget" && ref.data?.widget_type === "charts_widget_v2") return formatChart(ref.data.content);
-		if (mode === "alt") return formatAlt(ref.alt);
-		if (output === "markdown" && (ref.type === "image_group" || ref.type === "image_v2")) {
-			const images = formatImageResults(ref);
-			if (images) return images;
-			return formatAlt(ref.alt);
-		}
-		const sources = getInlineSources(ref);
-		if (sources.length > 0) {
-			const separator = output === "markdown" ? ", " : "; ";
-			return `(${sources.map((source) => formatCitationSource(source, output)).join(separator)})`;
-		}
-		return formatAlt(ref.alt);
-	}
-	function formatImageResults(ref) {
-		return (ref.images ?? []).map((entry) => {
-			const image = entry.image_result ?? entry;
-			const src = image.content_url?.trim();
-			if (!src) return "";
-			const markdown = `![${escapeMarkdownText(image.title?.trim() || "Image")}](<${escapeMarkdownUrl(src)}>)`;
-			const page = image.url?.trim();
-			return page ? `[${markdown}](<${escapeMarkdownUrl(page)}>)` : markdown;
-		}).filter(Boolean).join("\n\n");
-	}
-	function formatChart(chart) {
-		const { meta, xKey, series = [], data = [], formattedData } = chart ?? {};
-		if (!xKey || series.length === 0 || data.length === 0) return "";
-		const cell = (value) => String(value ?? "").replaceAll("|", "\\|").replaceAll("\n", " ");
-		const row = (cells) => `| ${cells.map(cell).join(" | ")} |`;
-		const rows = data.map((point, index) => row([point[xKey], ...series.map(({ dataKey, valueSuffix = "" }) => formattedData?.[index]?.[dataKey] ?? (point[dataKey] == null ? "" : `${point[dataKey]}${valueSuffix}`))]));
-		const table = [
-			row([xKey, ...series.map(({ dataKey, label }) => label || dataKey)]),
-			row([xKey, ...series].map(() => "---")),
-			...rows
-		].join("\n");
-		const description = meta?.description?.trim();
-		return description ? `${description}\n\n${table}` : table;
-	}
-	function formatAlt(alt) {
-		return alt?.replaceAll(/\[([^\]]*)\]\(\)/g, "$1") ?? "";
-	}
-	function getInlineSources(ref) {
-		const sources = [];
-		for (const item of ref.items ?? []) {
-			sources.push(item);
-			sources.push(...item.supporting_websites ?? []);
-		}
-		sources.push(...ref.fallback_items ?? []);
-		if (sources.length === 0 && ref.type === "file" && ref.name) sources.push({ title: ref.name });
-		if (sources.length === 0 && (ref.url || ref.title || ref.attribution)) sources.push(ref);
-		const safeUrls = ref.safe_urls?.filter(Boolean) ?? [];
-		if (sources.length === 0 && safeUrls.length) sources.push(...safeUrls.map((url) => ({
-			title: url,
-			url
-		})));
-		return dedupeSources(sources);
-	}
-	function getSourcesFootnoteSources(contentRefs) {
-		return dedupeSources(contentRefs.filter((ref) => ref.type === "sources_footnote").flatMap((ref) => {
-			if (ref.sources?.length) return ref.sources;
-			if (ref.items?.length) return ref.items;
-			if (ref.fallback_items?.length) return ref.fallback_items;
-			if (ref.safe_urls?.length) return ref.safe_urls.map((url) => ({
-				title: url,
-				url
-			}));
-			return [];
-		}));
-	}
-	function appendSourcesSection(input, sources, output, label) {
-		const trimmed = input.trimEnd();
-		const sourceList = output === "markdown" ? [
-			`**${escapeMarkdownText(label)}:**`,
-			"",
-			...sources.map((source) => `- ${formatCitationSource(source, output)}`)
-		].join("\n") : [`${label}:`, ...sources.map((source, index) => `${index + 1}. ${formatCitationSource(source, output)}`)].join("\n");
-		return trimmed ? `${trimmed}\n\n${sourceList}` : sourceList;
-	}
-	function dedupeSources(sources) {
-		const seen = new Set();
-		const result = [];
-		for (const source of sources) {
-			const key = source.url?.trim() || getSourceLabel(source);
-			if (!key || seen.has(key)) continue;
-			seen.add(key);
-			result.push(source);
-		}
-		return result;
-	}
-	function getSourceLabel(source) {
-		return source.attribution?.trim() || source.title?.trim() || source.url?.trim() || "Source";
-	}
-	function escapeMarkdownText(input) {
-		return input.replaceAll("\\", "\\\\").replaceAll("[", "\\[").replaceAll("]", "\\]").replaceAll("\n", " ");
-	}
-	function escapeMarkdownUrl(input) {
-		return input.replaceAll("<", "%3C").replaceAll(">", "%3E").replaceAll("\n", "");
-	}
-	function escapeRegExp(input) {
-		return input.replaceAll(/[.*+?^${}()|[\]\\]/g, "\\$&");
-	}
-	var require_truncate = __commonJSMin(((exports, module) => {
-		function isHighSurrogate(codePoint) {
-			return codePoint >= 55296 && codePoint <= 56319;
-		}
-		function isLowSurrogate(codePoint) {
-			return codePoint >= 56320 && codePoint <= 57343;
-		}
-		module.exports = function truncate(getLength, string, byteLength) {
-			if (typeof string !== "string") throw new Error("Input must be string");
-			var charLength = string.length;
-			var curByteLength = 0;
-			var codePoint;
-			var segment;
-			for (var i = 0; i < charLength; i += 1) {
-				codePoint = string.charCodeAt(i);
-				segment = string[i];
-				if (isHighSurrogate(codePoint) && isLowSurrogate(string.charCodeAt(i + 1))) {
-					i += 1;
-					segment += string[i];
-				}
-				curByteLength += getLength(segment);
-				if (curByteLength === byteLength) return string.slice(0, i + 1);
-				else if (curByteLength > byteLength) return string.slice(0, i - segment.length + 1);
-			}
-			return string;
-		};
-	}));
-	var require_browser$1 = __commonJSMin(((exports, module) => {
-		function isHighSurrogate(codePoint) {
-			return codePoint >= 55296 && codePoint <= 56319;
-		}
-		function isLowSurrogate(codePoint) {
-			return codePoint >= 56320 && codePoint <= 57343;
-		}
-		module.exports = function getByteLength(string) {
-			if (typeof string !== "string") throw new Error("Input must be string");
-			var charLength = string.length;
-			var byteLength = 0;
-			var codePoint = null;
-			var prevCodePoint = null;
-			for (var i = 0; i < charLength; i++) {
-				codePoint = string.charCodeAt(i);
-				if (isLowSurrogate(codePoint)) {
-					if (prevCodePoint != null && isHighSurrogate(prevCodePoint)) byteLength += 1;
-					else byteLength += 3;
-				} else if (codePoint <= 127) byteLength += 1;
-				else if (codePoint >= 128 && codePoint <= 2047) byteLength += 2;
-				else if (codePoint >= 2048 && codePoint <= 65535) byteLength += 3;
-				prevCodePoint = codePoint;
-			}
-			return byteLength;
-		};
-	}));
-	var require_browser = __commonJSMin(((exports, module) => {
-		var truncate = require_truncate();
-		var getLength = require_browser$1();
-		module.exports = truncate.bind(null, getLength);
-	}));
-	var import_sanitize_filename = __toESM(__commonJSMin(((exports, module) => {
-		var truncate = require_browser();
-		var illegalRe = /[\/\?<>\\:\*\|"]/g;
-		var controlRe = /[\x00-\x1f\x80-\x9f]/g;
-		var reservedRe = /^\.+$/;
-		var windowsReservedRe = /^(con|prn|aux|nul|com[0-9]|lpt[0-9])(\..*)?$/i;
-		var windowsTrailingRe = /[\. ]+$/;
-		function sanitize(input, replacement) {
-			if (typeof input !== "string") throw new Error("Input must be string");
-			return truncate(input.replace(illegalRe, replacement).replace(controlRe, replacement).replace(reservedRe, replacement).replace(windowsReservedRe, replacement).replace(windowsTrailingRe, replacement), 255);
-		}
-		module.exports = function(input, options) {
-			var replacement = options && options.replacement || "";
-			var output = sanitize(input, replacement);
-			if (replacement === "") return output;
-			return sanitize(output, "");
-		};
-	}))(), 1);
-	function noop() {}
-	function nonNullable(x) {
-		return x != null;
-	}
-	function onloadSafe(fn) {
-		if (document.readyState === "complete") fn();
-		else window.addEventListener("load", fn);
-	}
-	var _WORKER_SRC = "onmessage=function(e){setTimeout(function(){postMessage(e.data)},e.data.ms)}";
-	var _sleepWorker = null;
-	var _sleepWorkerFailed = false;
-	var _pendingResolves = new Map();
-	var _sleepIdCounter = 0;
-	function _getSleepWorker() {
-		if (_sleepWorkerFailed) return null;
-		if (_sleepWorker) return _sleepWorker;
-		try {
-			const blob = new Blob([_WORKER_SRC], { type: "application/javascript" });
-			const url = URL.createObjectURL(blob);
-			const w = new Worker(url);
-			URL.revokeObjectURL(url);
-			w.onmessage = (e) => {
-				const resolve = _pendingResolves.get(e.data.id);
-				if (resolve) {
-					_pendingResolves.delete(e.data.id);
-					resolve();
-				}
-			};
-			w.onerror = () => {
-				_sleepWorkerFailed = true;
-				_sleepWorker = null;
-				for (const resolve of _pendingResolves.values()) resolve();
-				_pendingResolves.clear();
-			};
-			_sleepWorker = w;
-			return w;
-		} catch {
-			_sleepWorkerFailed = true;
-			return null;
-		}
-	}
-	function sleep(ms) {
-		if (ms <= 0) return Promise.resolve();
-		const worker = _getSleepWorker();
-		if (!worker) return new Promise((resolve) => setTimeout(resolve, ms));
-		return new Promise((resolve) => {
-			const id = _sleepIdCounter++;
-			_pendingResolves.set(id, resolve);
-			worker.postMessage({
-				id,
-				ms
-			});
-		});
-	}
-	function dateStr(date = new Date()) {
-		return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
-	}
-	function timestamp() {
-		return new Date().toISOString().replace(/:/g, "-").replace(/\..+/, "");
-	}
-	function getColorScheme() {
-		const root = document.documentElement;
-		const theme = root.getAttribute("data-theme");
-		if (theme === "light" || theme === "dark") return theme;
-		if (root.classList.contains("dark")) return "dark";
-		if (root.classList.contains("light")) return "light";
-		const scheme = getComputedStyle(root).colorScheme;
-		if (scheme === "light" || scheme === "dark") return scheme;
-		return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
-	}
-	function unixTimestampToISOString(timestamp) {
-		if (!timestamp) return "";
-		return new Date(timestamp * 1e3).toISOString();
-	}
-	function jsonlStringify(list) {
-		return list.map((msg) => JSON.stringify(msg)).join("\n");
-	}
-	function downloadFile(filename, type, content) {
-		const blob = content instanceof Blob ? content : new Blob([content], { type });
-		const url = URL.createObjectURL(blob);
-		const a = document.createElement("a");
-		a.href = url;
-		a.download = filename;
-		document.body.appendChild(a);
-		a.click();
-		document.body.removeChild(a);
-		setTimeout(() => URL.revokeObjectURL(url), 1e3);
-	}
-	function normalizeProjectName(projectName) {
-		return projectName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
-	}
-	function partSuffix(partInfo) {
-		if (!partInfo || partInfo.total <= 1) return "";
-		const pad = (n) => String(n).padStart(2, "0");
-		return `-part-${pad(partInfo.part)}-of-${pad(partInfo.total)}`;
-	}
-	function buildZipFileName(format, projectName, partInfo) {
-		const suffix = partSuffix(partInfo);
-		if (projectName) return `chatgpt-export-${format}-project-${normalizeProjectName(projectName)}${suffix}.zip`;
-		return `chatgpt-export-${format}${suffix}.zip`;
-	}
-	function buildJsonBatchFileName(projectName, partInfo) {
-		const suffix = partSuffix(partInfo);
-		if (projectName) return `chatgpt-export-project-${normalizeProjectName(projectName)}${suffix}.json`;
-		return `chatgpt-export${suffix}.json`;
-	}
-	function getFileNameWithFormat(format, ext, { title = document.title, chatId = "", createTime = Math.floor(Date.now() / 1e3), updateTime = Math.floor(Date.now() / 1e3) } = {}) {
-		const _title = (0, import_sanitize_filename.default)(title).replace(/\s+/g, "_");
-		const _createTime = unixTimestampToISOString(createTime);
-		const _updateTime = unixTimestampToISOString(updateTime);
-		return format.replace("{title}", _title).replace("{date}", dateStr()).replace("{timestamp}", timestamp()).replace("{chat_id}", chatId).replace("{create_time}", _createTime).replace("{update_time}", _updateTime).concat(`.${ext}`);
-	}
-	var CodeRegex = /(```[\s\S]*?(?:```|$)|`[^`\n]+`)/;
-	var MathRegex = new RegExp([
-		/(?<blockStart>^|\n)(?<indent>[ \t]*)\\\[(?<block>[\s\S]+?)\\\][ \t]*(?=\n|$)/.source,
-		/\\\[(?<display>[\s\S]+?)\\\]/.source,
-		/\\\((?<inline>[\s\S]+?)\\\)/.source,
-		/(?<dollarBlock>\$\$[\s\S]+?\$\$)/.source,
-		/(?<=^|\s)(?<dollarInline>\$[^\s$][^$\n]*\$)(?=\s|$)/.source
-	].join("|"), "g");
-	function protectMath(input) {
-		const formulas = [];
-		const placeholder = (formula) => `╬${formulas.push(formula) - 1}╬`;
-		const text = input.split(CodeRegex).map((part, index) => {
-			if (index % 2 === 1) return part;
-			return part.replace(MathRegex, (...args) => {
-				const groups = args.at(-1);
-				if (groups.block != null) {
-					const { blockStart = "", indent = "" } = groups;
-					return `${blockStart}${indent}${placeholder(`$$\n${groups.block.trim()}\n${indent}$$`)}`;
-				}
-				if (groups.display != null) return placeholder(`$$${groups.display.trim()}$$`);
-				if (groups.inline != null) return placeholder(`$${groups.inline.trim()}$`);
-				return placeholder(groups.dollarBlock ?? groups.dollarInline ?? "");
-			});
-		}).join("");
-		const restore = (output, escape = (formula) => formula) => output.replace(/╬(\d+)╬/g, (match, index) => {
-			const formula = formulas[Number(index)];
-			return formula == null ? match : escape(formula);
-		});
-		return {
-			text,
-			restore
-		};
-	}
-	function toBracketDelimiters(formula) {
-		const display = /^\$\$([\s\S]*)\$\$$/.exec(formula);
-		if (display) return `\\[${display[1]}\\]`;
-		return `\\(${formula.slice(1, -1)}\\)`;
 	}
 	var element = document.createElement("i");
 	function decodeNamedCharacterReference(value) {
@@ -10780,7 +8588,41 @@
 		for (const { segment } of graphemes.segment(value)) width += WIDE.test(segment) ? 2 : 1;
 		return width;
 	}
-	function toMarkdown(ast, source) {
+	function isLocalImageSrc(src) {
+		return !/^(?:[a-z][a-z\d+.-]*:|\/\/)/i.test(src.trim()) || /^data:/i.test(src.trim());
+	}
+	var ImgTagRegex = /<img\b[^>]*>/gi;
+	function srcOfImgTag(tag) {
+		return /\bsrc\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i.exec(tag)?.slice(1).find((x) => x != null) ?? "";
+	}
+	function rewriteTree(node, options) {
+		if (node.type === "heading" && options.headingOffset) node.depth = Math.min(6, node.depth + options.headingOffset);
+		if (options.dropRemoteImages) {
+			if (node.type === "image" && !isLocalImageSrc(node.url)) return [];
+			if (node.type === "imageReference") return [];
+			if (node.type === "html") {
+				const value = node.value.replace(ImgTagRegex, (tag) => isLocalImageSrc(srcOfImgTag(tag)) ? tag : "");
+				if (value !== node.value) {
+					if (!value.trim()) return [];
+					node.value = value;
+				}
+			}
+		}
+		if (Array.isArray(node.children)) {
+			const before = node.children.length;
+			node.children = node.children.flatMap((child) => rewriteTree(child, options));
+			if (node.children.length < before && node.children.length === 0 && [
+				"link",
+				"paragraph",
+				"emphasis",
+				"strong",
+				"delete"
+			].includes(node.type)) return [];
+		}
+		return [node];
+	}
+	function toMarkdown(ast, source, options = {}) {
+		if (options.headingOffset || options.dropRemoteImages) rewriteTree(ast, options);
 		const slice = (node) => {
 			const start = node.position.start.offset;
 			let end = node.position.end.offset;
@@ -10807,15 +8649,111 @@
 			}
 		});
 	}
-	var dropRawHtml = { exit: {
-		htmlFlowData() {},
-		htmlTextData() {}
-	} };
+	var KEPT_TAGS = new Set([
+		"br",
+		"details",
+		"summary",
+		"kbd",
+		"sub",
+		"sup",
+		"mark",
+		"u"
+	]);
+	var DROPPED_CONTENT_TAGS = new Set([
+		"script",
+		"style",
+		"iframe",
+		"object",
+		"embed",
+		"template",
+		"noscript",
+		"textarea",
+		"title",
+		"svg",
+		"math",
+		"head"
+	]);
+	var HtmlPieceRegex = /<!--[\s\S]*?-->|<(\/?)([a-z][a-z\d-]*)(?:\s[^>]*)?(\/?)>|[^<]+|</gi;
+	function sanitizeRawHtml(raw, state) {
+		let out = "";
+		for (const [piece, closing, name, selfClosing] of raw.matchAll(HtmlPieceRegex)) {
+			if (piece.startsWith("<!--")) continue;
+			if (name) {
+				const tag = name.toLowerCase();
+				if (state.dropping) {
+					if (closing && tag === state.dropping) state.dropping = null;
+					continue;
+				}
+				if (DROPPED_CONTENT_TAGS.has(tag)) {
+					if (!closing && !selfClosing) state.dropping = tag;
+					continue;
+				}
+				if (KEPT_TAGS.has(tag)) out += closing ? `</${tag}>` : `<${tag}>`;
+				continue;
+			}
+			if (state.dropping) continue;
+			out += piece === "<" ? "&lt;" : piece.replace(/&(?!#?\w+;)/g, "&amp;").replace(/>/g, "&gt;");
+		}
+		return out;
+	}
+	var safeRawHtml = {
+		enter: {
+			htmlFlow() {
+				this.setData("rawHtmlState", { dropping: null });
+			},
+			htmlText() {
+				if (!this.getData("rawHtmlState")) this.setData("rawHtmlState", { dropping: null });
+			}
+		},
+		exit: {
+			htmlFlowData(token) {
+				this.raw(sanitizeRawHtml(this.sliceSerialize(token), this.getData("rawHtmlState")));
+			},
+			htmlTextData(token) {
+				this.raw(sanitizeRawHtml(this.sliceSerialize(token), this.getData("rawHtmlState")));
+			}
+		}
+	};
 	function toHtml(markdown) {
 		return micromark(markdown, {
 			extensions: [gfm()],
-			htmlExtensions: [gfmHtml(), dropRawHtml]
-		});
+			htmlExtensions: [gfmHtml(), safeRawHtml]
+		}).replaceAll("<table>", "<div class=\"table-wrap\"><table>").replaceAll("</table>", "</table></div>").replaceAll("<pre><code class=\"language-mermaid\">", "<pre class=\"mermaid-source\"><code class=\"language-mermaid nohighlight\">");
+	}
+	function codeFence(text, language = "") {
+		const longest = Math.max(0, ...Array.from(text.matchAll(/`+/g), (match) => match[0].length));
+		const fence = "`".repeat(Math.max(3, longest + 1));
+		return `${fence}${language}\n${text}\n${fence}`;
+	}
+	function plainTextToMarkdown(text) {
+		const lines = text.split("\n");
+		const fenceOpen = /^( {0,3})(`{3,}|~{3,})(.*)$/;
+		const fenceClose = /^ {0,3}(`{3,}|~{3,})[ \t]*$/;
+		const escapeLine = (line) => line.replace(/^( {0,3})(#{1,6})(?=\s|$)/, "$1\\$2").replace(/^( {0,3})>/, "$1\\>").replace(/^( {0,3})(`{3,}|~{3,})/, "$1\\$2").replace(/^( {0,3})(?=(?:-\s*){2,}$|(?:=\s*)+$|(?:\*\s*){3,}$|(?:_\s*){3,}$)/, "$1\\").replace(/<(?=[a-z/!?])/gi, "\\<");
+		const result = [];
+		let i = 0;
+		while (i < lines.length) {
+			const open = fenceOpen.exec(lines[i]);
+			const isFence = open && !(open[2][0] === "`" && open[3].includes("`"));
+			let end = -1;
+			if (isFence) for (let j = i + 1; j < lines.length; j++) {
+				const close = fenceClose.exec(lines[j]);
+				if (close && close[1][0] === open[2][0] && close[1].length >= open[2].length) {
+					end = j;
+					break;
+				}
+			}
+			if (isFence && end !== -1) {
+				result.push(...lines.slice(i, end + 1));
+				i = end + 1;
+				continue;
+			}
+			const line = escapeLine(lines[i]);
+			const continues = i + 1 < lines.length && lines[i].trim() !== "" && lines[i + 1].trim() !== "";
+			result.push(continues && !line.endsWith("  ") ? `${line}  ` : line);
+			i++;
+		}
+		return result.join("\n");
 	}
 	function flatMap(tree, fn) {
 		function transform(node, i, parent) {
@@ -10827,8 +8765,2623 @@
 		}
 		return transform(tree, 0, void 0)[0];
 	}
+	var InlineCodeRegex = /((?<!`)(`+)(?!`)[^\n]*?(?<!`)\2(?!`))/;
+	var FenceRegex$1 = /^[ \t]*(?:>[ \t]*)*(`{3,}|~{3,})(.*)$/;
+	var FenceCloseRegex$1 = /^[ \t]*(?:>[ \t]*)*(`{3,}|~{3,})[ \t]*$/;
+	function mapOutsideCode(input, transform) {
+		const lines = input.split("\n");
+		let result = "";
+		let buffer = [];
+		const flush = (hasMore) => {
+			if (buffer.length === 0) return;
+			const text = buffer.join("\n") + (hasMore ? "\n" : "");
+			result += text.split(InlineCodeRegex).map((part, index) => index % 3 === 0 ? transform(part) : index % 3 === 1 ? part : "").join("");
+			buffer = [];
+		};
+		let i = 0;
+		while (i < lines.length) {
+			const open = FenceRegex$1.exec(lines[i]);
+			if (!open || open[1][0] === "`" && open[2].includes("`")) {
+				buffer.push(lines[i]);
+				i++;
+				continue;
+			}
+			flush(true);
+			const marker = open[1];
+			let end = i + 1;
+			while (end < lines.length) {
+				const close = FenceCloseRegex$1.exec(lines[end]);
+				if (close && close[1][0] === marker[0] && close[1].length >= marker.length) break;
+				end++;
+			}
+			end = Math.min(end, lines.length - 1);
+			result += lines.slice(i, end + 1).join("\n") + (end < lines.length - 1 ? "\n" : "");
+			i = end + 1;
+		}
+		flush(false);
+		return result;
+	}
+	var TagRegex = /<(\/?)([A-Za-z][\w-]*)((?:[^>"'{}]|"[^"]*"|'[^']*'|\{(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*\})*?)(\/?)>/g;
+	var AttributeRegex = /([A-Za-z][\w-]*)=(?:"([^"]*)"|\{((?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*)\})/g;
+	var LAYOUT_TAGS = new Set([
+		"box",
+		"row",
+		"grid",
+		"grid-item",
+		"text",
+		"caption",
+		"radio-group",
+		"label"
+	]);
+	function attributesOf(source) {
+		const attributes = {};
+		for (const [, name, quoted, braced] of source.matchAll(AttributeRegex)) attributes[name] = quoted ?? braced;
+		return attributes;
+	}
+	function optionLabels(options) {
+		if (!options) return [];
+		try {
+			return JSON.parse(options).map((option) => String(option.label ?? "")).filter(Boolean);
+		} catch {
+			return [];
+		}
+	}
+	function convertTag(match, closing, name, attributeSource) {
+		const attributes = attributesOf(attributeSource);
+		const lower = name.toLowerCase();
+		if (LAYOUT_TAGS.has(lower)) return "\n\n";
+		switch (name) {
+			case "Link": {
+				const { url, title } = attributes;
+				if (!url) return title ?? "";
+				return `[${(title || url).replaceAll("[", "&#91;").replaceAll("]", "&#93;").replaceAll("|", "\\|")}](<${url.replaceAll("|", "%7C")}>)`;
+			}
+			case "Entity": return (attributes.value ?? "").replaceAll("|", "\\|");
+			case "Cite":
+			case "MemoryCite":
+			case "AsyncImage": return "";
+		}
+		switch (lower) {
+			case "icon": return "";
+			case "divider": return "\n\n---\n\n";
+			case "title": return closing ? "**\n\n" : "\n\n**";
+			case "badge": return closing ? ")" : "(";
+			case "button": return closing ? "]" : "[";
+			case "radio": return closing ? "\n" : "\n- ";
+			case "segmented-control":
+			case "select": return `\n\n${optionLabels(attributes.options).map((label) => `- ${label}`).join("\n")}\n\n`;
+		}
+		return match;
+	}
+	var EACH_OPEN = /\{#each\s/g;
+	var EACH_CLOSE = /\{\/each\}/g;
+	function skipArray(text, start) {
+		let depth = 0;
+		let quote = "";
+		for (let i = start; i < text.length; i++) {
+			const char = text[i];
+			if (quote) {
+				if (char === "\\") i++;
+				else if (char === quote) quote = "";
+			} else if (char === "\"" || char === "'") quote = char;
+			else if (char === "[") depth++;
+			else if (char === "]" && --depth === 0) return i + 1;
+		}
+		return -1;
+	}
+	function lookup(item, path) {
+		let value = item;
+		for (const [, key, index] of path.matchAll(/\.(\w+)|\[(\d+)\]/g)) {
+			if (value == null || typeof value !== "object") return "";
+			value = value[key ?? index];
+		}
+		return value == null || typeof value === "object" ? "" : String(value);
+	}
+	function evaluateCondition(condition) {
+		const operand = (text) => text.trim().replace(/^(['"])(.*)\1$/, "$2");
+		return condition.split("||").some((part) => part.split("&&").every((atom) => {
+			const match = /^\s*(.+?)\s*(===|!==|==|!=|<=|>=|<|>)\s*(.+?)\s*$/.exec(atom);
+			if (!match) return atom.trim() !== "false";
+			const [left, right] = [operand(match[1]), operand(match[3])];
+			const numbers = [Number(left), Number(right)];
+			const [a, b] = left !== "" && right !== "" && numbers.every(Number.isFinite) ? numbers : [left, right];
+			switch (match[2]) {
+				case "===":
+				case "==": return a === b;
+				case "!==":
+				case "!=": return a !== b;
+				case "<": return a < b;
+				case ">": return a > b;
+				case "<=": return a <= b;
+				default: return a >= b;
+			}
+		}));
+	}
+	function resolveConditions(body) {
+		return body.replaceAll(/\{#if\s+([^}\n]*)\}([\s\S]*?)(?:\{:else\}([\s\S]*?))?\{\/if\}/g, (_, condition, yes, no = "") => evaluateCondition(condition) ? yes : no);
+	}
+	function expandEach(block, indent) {
+		const open = /^\{#each\s+/.exec(block);
+		const arrayStart = open ? open[0].length : -1;
+		const arrayEnd = arrayStart < 0 ? -1 : skipArray(block, arrayStart);
+		const header = arrayEnd < 0 ? null : /^\s+as\s+(\w+)(?:\s*,\s*(\w+))?\s*\}/.exec(block.slice(arrayEnd));
+		if (!header) return "";
+		let items;
+		try {
+			items = JSON.parse(block.slice(arrayStart, arrayEnd).replaceAll(/,\s*([\]}])/g, "$1"));
+		} catch {
+			return "";
+		}
+		if (!Array.isArray(items)) return "";
+		const [, itemName, indexName] = header;
+		const bodyLines = block.slice(arrayEnd + header[0].length, block.lastIndexOf("{/each}")).split("\n");
+		const bodyIndent = Math.min(Infinity, ...bodyLines.filter((line) => line.trim()).map((line) => line.length - line.trimStart().length));
+		const shift = Number.isFinite(bodyIndent) ? Math.max(0, bodyIndent - indent) : 0;
+		const body = bodyLines.map((line) => line.slice(Math.min(shift, line.length - line.trimStart().length))).join("\n");
+		return items.map((item, index) => {
+			return resolveConditions(body.replaceAll(new RegExp(`\\{${itemName}((?:\\[\\d+\\]|\\.\\w+)*)\\}`, "g"), (_, path) => path ? lookup(item, path) : typeof item === "object" ? "" : String(item)).replaceAll(indexName ? new RegExp(`\\{${indexName}\\}`, "g") : /(?!)/g, String(index)).replaceAll(/\{#if\s+([^}\n]*)\}/g, (_, condition) => `{#if ${indexName ? condition.replaceAll(new RegExp(`\\b${indexName}\\b`, "g"), String(index)) : condition}}`));
+		}).join("\n");
+	}
+	function eachBlockEnd(lines, start) {
+		let depth = 0;
+		for (let i = start; i < lines.length; i++) {
+			depth += (lines[i].match(EACH_OPEN) ?? []).length - (lines[i].match(EACH_CLOSE) ?? []).length;
+			if (depth <= 0) return i;
+		}
+		return lines.length - 1;
+	}
+	var FenceRegex = /^( {0,3})(`{3,}|~{3,})(.*)$/;
+	var FenceCloseRegex = /^ {0,3}(`{3,}|~{3,})[ \t]*$/;
+	function prepare(markup) {
+		const lines = markup.split("\n");
+		const out = [];
+		let depth = 0;
+		let i = 0;
+		while (i < lines.length) {
+			const line = lines[i];
+			const fence = FenceRegex.exec(line);
+			if (fence && !(fence[2][0] === "`" && fence[3].includes("`"))) {
+				let end = i + 1;
+				while (end < lines.length) {
+					const close = FenceCloseRegex.exec(lines[end]);
+					if (close && close[1][0] === fence[2][0] && close[1].length >= fence[2].length) break;
+					end++;
+				}
+				end = Math.min(end, lines.length - 1);
+				out.push(...lines.slice(i, end + 1));
+				i = end + 1;
+				continue;
+			}
+			const codeBlock = /^\s*<CodeBlock\b([^>]*)>(.*)$/.exec(line);
+			if (codeBlock) {
+				const body = [];
+				let end = i;
+				let text = codeBlock[2];
+				let inner = null;
+				for (;;) {
+					const closeAt = text.indexOf("</CodeBlock>");
+					if (closeAt !== -1) {
+						body.push(text.slice(0, closeAt));
+						break;
+					}
+					if (end > i) {
+						const innerClose = FenceCloseRegex.exec(text);
+						if (inner) {
+							if (innerClose && innerClose[1][0] === inner[0] && innerClose[1].length >= inner.length) inner = null;
+						} else if (innerClose) break;
+						else {
+							const innerOpen = FenceRegex.exec(text);
+							if (innerOpen && !(innerOpen[2][0] === "`" && innerOpen[3].includes("`"))) inner = innerOpen[2];
+						}
+					}
+					body.push(text);
+					if (end + 1 >= lines.length) break;
+					end++;
+					text = lines[end];
+				}
+				while (body.length > 0 && body[0].trim() === "") body.shift();
+				while (body.length > 0 && body[body.length - 1].trim() === "") body.pop();
+				const { language = "" } = attributesOf(codeBlock[1]);
+				out.push("", codeFence(body.join("\n"), language), "");
+				i = end + 1;
+				continue;
+			}
+			if (/^\s*\{#each\s/.test(line)) {
+				const end = eachBlockEnd(lines, i);
+				lines.splice(i, end - i + 1, ...expandEach(lines.slice(i, end + 1).join("\n").trim(), line.length - line.trimStart().length).split("\n"));
+				continue;
+			}
+			if (/^\s*\{@\w+[^\n]*\}\s*$/.test(line)) {
+				i++;
+				continue;
+			}
+			const indent = line.length - line.trimStart().length;
+			out.push(line.slice(Math.min(indent, depth * 2)));
+			for (const [, closing, name, , selfClosing] of line.matchAll(TagRegex)) {
+				if (!LAYOUT_TAGS.has(name.toLowerCase()) || selfClosing) continue;
+				depth = Math.max(0, depth + (closing ? -1 : 1));
+			}
+			i++;
+		}
+		return out.join("\n");
+	}
+	function hasRuntimeTemplates(markup) {
+		return /\{#(?:each|if)\s|<text\b[^>]*>\s*\{`/.test(markup);
+	}
+	var TemplateTextRegex = /<text\b([^>]*)>\s*\{`([\s\S]*?)`\}\s*<\/text>/g;
+	function expandTemplateText(text) {
+		return text.replace(TemplateTextRegex, (_, attributes, content) => {
+			return /\bpreserveWhitespace\b/.test(attributes) ? `\n\n${codeFence(content)}\n\n` : content;
+		});
+	}
+	function dilToMarkdown(markup) {
+		return mapOutsideCode(prepare(expandTemplateText(markup)), (text) => text.replace(TagRegex, convertTag)).replaceAll(/[ \t]+$/gm, "").replaceAll(/\n{3,}/g, "\n\n").trim();
+	}
+	var DB_NAME = "chatgpt-exporter";
+	var STORE_NAME = "images";
+	var EXPIRY_MS = 2592e6;
+	var dbPromise = null;
+	function promisify(request) {
+		return new Promise((resolve, reject) => {
+			request.onsuccess = () => resolve(request.result);
+			request.onerror = () => reject(request.error);
+		});
+	}
+	function openDb() {
+		dbPromise ??= new Promise((resolve) => {
+			const request = indexedDB.open(DB_NAME, 1);
+			request.onupgradeneeded = () => {
+				request.result.createObjectStore(STORE_NAME).createIndex("savedAt", "savedAt");
+			};
+			request.onsuccess = () => {
+				pruneExpired(request.result);
+				resolve(request.result);
+			};
+			request.onerror = () => resolve(null);
+		}).catch(() => null);
+		return dbPromise;
+	}
+	function pruneExpired(db) {
+		try {
+			const cursorRequest = db.transaction(STORE_NAME, "readwrite").objectStore(STORE_NAME).index("savedAt").openCursor(IDBKeyRange.upperBound(Date.now() - EXPIRY_MS));
+			cursorRequest.onsuccess = () => {
+				const cursor = cursorRequest.result;
+				if (!cursor) return;
+				cursor.delete();
+				cursor.continue();
+			};
+		} catch (error) {
+			console.warn("[Exporter] Failed to prune image cache", error);
+		}
+	}
+	async function getCachedImage(pointer) {
+		try {
+			const db = await openDb();
+			if (!db) return null;
+			const entry = await promisify(db.transaction(STORE_NAME, "readonly").objectStore(STORE_NAME).get(pointer));
+			if (!entry || Date.now() - entry.savedAt > EXPIRY_MS) return null;
+			return entry.dataUrl;
+		} catch {
+			return null;
+		}
+	}
+	async function setCachedImage(pointer, dataUrl) {
+		try {
+			const db = await openDb();
+			if (!db) return;
+			const entry = {
+				dataUrl,
+				savedAt: Date.now()
+			};
+			await promisify(db.transaction(STORE_NAME, "readwrite").objectStore(STORE_NAME).put(entry, pointer));
+		} catch (error) {
+			console.warn("[Exporter] Failed to cache image", error);
+		}
+	}
+	var generateKey = (args) => JSON.stringify(args);
+	function memorize(fn) {
+		const cache = new Map();
+		const memorized = (...args) => {
+			const key = generateKey(args);
+			if (cache.has(key)) return cache.get(key);
+			const result = fn(...args);
+			cache.set(key, result);
+			return result;
+		};
+		return memorized;
+	}
+	var aliases = [["text-davinci-002", "GPT-3.5"], ["gpt-4-browsing", "GPT-4 (Browser)"]];
+	function getModelName(slug) {
+		const alias = aliases.find(([prefix]) => slug.startsWith(prefix));
+		if (alias) return alias[1];
+		const gpt = /^gpt-(\d+)(o)?(?:-(\d)(?=-|$))?/.exec(slug);
+		if (gpt) {
+			const [, major, omni = "", minor] = gpt;
+			return `GPT-${major}${minor ? `.${minor}` : ""}${omni}`;
+		}
+		const reasoning = /^o\d+/.exec(slug);
+		if (reasoning) return reasoning[0];
+		return "";
+	}
+	var urlcat = typeof import_dist.default === "function" ? import_dist.default : import_dist.default.default;
+	var sessionApi = urlcat(baseUrl, "/api/auth/session");
+	var conversationApi = (id) => urlcat(apiUrl, "/conversation/:id", { id });
+	var shareConversationApi = (id) => urlcat(apiUrl, "/share/:id", { id });
+	var conversationsApi = (offset, limit) => urlcat(apiUrl, "/conversations", {
+		offset,
+		limit
+	});
+	var fileDownloadApi = (id) => urlcat(apiUrl, "/files/download/:id", {
+		id,
+		post_id: "",
+		inline: false
+	});
+	var projectsApi = (cursor) => urlcat(apiUrl, "/gizmos/snorlax/sidebar", {
+		conversations_per_gizmo: 0,
+		cursor
+	});
+	var projectConversationsApi = (gizmo, cursor, limit) => urlcat(apiUrl, "/gizmos/:gizmo/conversations", {
+		gizmo,
+		cursor,
+		limit
+	});
+	var accountsCheckApi = urlcat(apiUrl, "/accounts/check/v4-2023-04-27");
+	async function getCurrentChatId() {
+		if (isSharePage()) {
+			const shareId = getChatIdFromUrl();
+			if (!shareId) throw new Error("No share id found.");
+			return `__share__${shareId}`;
+		}
+		if (isTemporaryChat()) {
+			const temporaryChatId = getTemporaryChatId();
+			if (!temporaryChatId) throw new Error("No temporary chat id found.");
+			return temporaryChatId;
+		}
+		const chatId = getChatIdFromUrl();
+		if (chatId) return chatId;
+		const conversations = await fetchConversations();
+		if (conversations && conversations.items.length > 0) return conversations.items[0].id;
+		throw new Error("No chat id found.");
+	}
+	async function fetchImageFromPointer(uri) {
+		const cached = await getCachedImage(uri);
+		if (cached) return cached;
+		const imageDetails = await fetchApi(fileDownloadApi(uri.replace("sediment://", "")));
+		if (imageDetails.status === "error") {
+			console.error("Failed to fetch image asset", imageDetails.error_code, imageDetails.error_message);
+			return null;
+		}
+		const image = await fetch(imageDetails.download_url);
+		const dataUrl = (await blobToDataURL(await image.blob())).replace(/^data:.*?;/, `data:${image.headers.get("content-type")};`);
+		await setCachedImage(uri, dataUrl);
+		return dataUrl;
+	}
+	async function withImageAssets(conversation) {
+		const copy = structuredClone(conversation);
+		await replaceImageAssets(copy);
+		return copy;
+	}
+	function collectImageSources(conversation) {
+		const isImagePart = (part) => {
+			return typeof part === "object" && part !== null && part.content_type === "image_asset_pointer" && typeof part.asset_pointer === "string";
+		};
+		return Object.values(conversation.mapping).flatMap((node) => {
+			const message = node.message;
+			if (!message) return [];
+			if (message.content.content_type === "multimodal_text") return (Array.isArray(message.content.parts) ? message.content.parts : []).filter(isImagePart).map((part) => ({
+				src: part.asset_pointer,
+				replace: (src) => {
+					part.asset_pointer = src;
+				}
+			}));
+			if (message.content.content_type === "execution_output") return (message.metadata?.aggregate_result?.messages ?? []).filter((msg) => msg.message_type === "image").map((msg) => ({
+				src: msg.image_url,
+				replace: (src) => {
+					msg.image_url = src;
+				}
+			}));
+			return [];
+		});
+	}
+	async function replaceImageSources(conversation, resolve) {
+		await Promise.all(collectImageSources(conversation).map(async (image) => {
+			try {
+				const newSrc = await resolve(image.src);
+				if (newSrc) image.replace(newSrc);
+			} catch (error) {
+				console.error("Failed to fetch image asset", error);
+			}
+		}));
+	}
+	function replaceImageAssets(conversation) {
+		return replaceImageSources(conversation, async (src) => {
+			if (!src.startsWith("sediment://")) return null;
+			return fetchImageFromPointer(src);
+		});
+	}
+	async function fetchConversation(chatId) {
+		if (chatId.startsWith("__share__")) {
+			const id = chatId.replace("__share__", "");
+			return {
+				id,
+				...await loadShareConversation(getConversationFromSharePage(), () => fetchApi(shareConversationApi(id)))
+			};
+		}
+		return {
+			id: chatId,
+			...await fetchApi(conversationApi(chatId))
+		};
+	}
+	async function fetchProjects() {
+		let cursor = null;
+		const allItems = [];
+		while (true) {
+			const { items, cursor: nextCursor = null } = await fetchApi(projectsApi(cursor));
+			cursor = nextCursor;
+			allItems.push(...items);
+			if (nextCursor === null) break;
+		}
+		return allItems.map((gizmo) => gizmo.gizmo.gizmo);
+	}
+	async function fetchConversations(offset = 0, limit = 20, project = null) {
+		if (project) return fetchProjectConversations(project, offset, limit);
+		return fetchApi(conversationsApi(offset, limit));
+	}
+	async function fetchProjectConversations(project, cursor = 0, limit = 20) {
+		const { items, cursor: nextCursor } = await fetchApi(projectConversationsApi(project, cursor, limit));
+		return {
+			has_missing_conversations: false,
+			items,
+			limit,
+			offset: typeof cursor === "number" ? cursor : 0,
+			total: null,
+			cursor: nextCursor ?? null
+		};
+	}
+	async function fetchConversationsPage(project, offset, limit) {
+		return fetchConversations(offset, limit, project);
+	}
+	async function fetchAllConversations(project = null, maxConversations = 1e3, onBatch, onHasMore, onError) {
+		const conversations = [];
+		const limit = project === null ? 100 : 50;
+		let offset = 0;
+		let cursor = 0;
+		while (true) try {
+			const result = project === null ? await fetchConversations(offset, limit) : await fetchProjectConversations(project, cursor, limit);
+			if (!result.items) {
+				console.warn("fetchAllConversations received no items at offset:", offset);
+				break;
+			}
+			conversations.push(...result.items);
+			if (result.items.length === 0) break;
+			onBatch?.(result.items);
+			if (result.total == null && result.cursor == null) break;
+			if (result.total !== null && offset + limit >= result.total) break;
+			if (conversations.length >= maxConversations) break;
+			if (result.cursor != null) cursor = result.cursor;
+			else offset += limit;
+		} catch (error) {
+			console.error("Error fetching conversations batch:", error);
+			onError?.(error);
+			break;
+		}
+		const result = conversations.slice(0, maxConversations);
+		onHasMore?.(result.length >= maxConversations);
+		return result;
+	}
+	async function archiveConversation(chatId) {
+		const { success } = await fetchApi(conversationApi(chatId), {
+			method: "PATCH",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ is_archived: true })
+		});
+		return success;
+	}
+	async function deleteConversation(chatId) {
+		const { success } = await fetchApi(conversationApi(chatId), {
+			method: "PATCH",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ is_visible: false })
+		});
+		return success;
+	}
+	var RateLimitError = class extends Error {
+		retryAfterMs;
+		retryAfterFromServer;
+		constructor(retryAfterHeader) {
+			super("Too Many Requests (429)");
+			this.name = "RateLimitError";
+			const secs = retryAfterHeader != null ? Number.parseInt(retryAfterHeader, 10) : NaN;
+			this.retryAfterFromServer = Number.isFinite(secs) && secs > 0;
+			this.retryAfterMs = this.retryAfterFromServer ? secs * 1e3 : 3e4;
+		}
+	};
+	var RATE_LIMIT_HEADERS = [
+		"retry-after",
+		"x-ratelimit-limit-requests",
+		"x-ratelimit-remaining-requests",
+		"x-ratelimit-reset-requests",
+		"x-ratelimit-limit-tokens",
+		"x-ratelimit-remaining-tokens",
+		"x-ratelimit-reset-tokens"
+	];
+	function logRateLimitHeaders(response) {
+		const found = {};
+		for (const h of RATE_LIMIT_HEADERS) {
+			const val = response.headers.get(h);
+			if (val != null) found[h] = val;
+		}
+		if (Object.keys(found).length > 0) console.info("[Exporter] Rate-limit headers:", found);
+	}
+	async function fetchApi(url, options) {
+		const accessToken = await getAccessToken();
+		const accountId = await getTeamAccountId();
+		const response = await fetch(url, {
+			...options,
+			headers: {
+				"Authorization": `Bearer ${accessToken}`,
+				"X-Authorization": `Bearer ${accessToken}`,
+				...accountId ? { "Chatgpt-Account-Id": accountId } : {},
+				...options?.headers
+			}
+		});
+		logRateLimitHeaders(response);
+		if (!response.ok) {
+			if (response.status === 429) throw new RateLimitError(response.headers.get("Retry-After"));
+			throw new Error(response.statusText);
+		}
+		return response.json();
+	}
+	async function probeApi() {
+		const accessToken = await getAccessToken();
+		const accountId = await getTeamAccountId();
+		const url = conversationsApi(0, 1);
+		const response = await fetch(url, { headers: {
+			"Authorization": `Bearer ${accessToken}`,
+			"X-Authorization": `Bearer ${accessToken}`,
+			...accountId ? { "Chatgpt-Account-Id": accountId } : {}
+		} });
+		const rateLimitHeaders = {};
+		for (const h of RATE_LIMIT_HEADERS) {
+			const val = response.headers.get(h);
+			if (val != null) rateLimitHeaders[h] = val;
+		}
+		if (!response.ok) {
+			if (response.status === 429) {
+				const secs = response.headers.get("retry-after");
+				return {
+					ok: false,
+					retryAfterMs: secs ? Number.parseInt(secs, 10) * 1e3 : 6e4,
+					rateLimitHeaders
+				};
+			}
+			return {
+				ok: false,
+				rateLimitHeaders
+			};
+		}
+		return {
+			ok: true,
+			rateLimitHeaders
+		};
+	}
+	async function _fetchSession() {
+		const response = await fetch(sessionApi);
+		if (!response.ok) throw new Error(response.statusText);
+		return response.json();
+	}
+	var fetchSession = memorize(_fetchSession);
+	async function getAccessToken() {
+		return (await fetchSession()).accessToken;
+	}
+	async function _fetchAccountsCheck() {
+		const accessToken = await getAccessToken();
+		const response = await fetch(accountsCheckApi, { headers: {
+			"Authorization": `Bearer ${accessToken}`,
+			"X-Authorization": `Bearer ${accessToken}`
+		} });
+		if (!response.ok) throw new Error(response.statusText);
+		return response.json();
+	}
+	var fetchAccountsCheck = memorize(_fetchAccountsCheck);
+	var getCookie = (key) => document.cookie.match(`(^|;)\\s*${key}\\s*=\\s*([^;]+)`)?.pop() || "";
+	async function getTeamAccountId() {
+		const accountsCheck = await fetchAccountsCheck();
+		const workspaceId = getCookie("_account");
+		if (workspaceId) {
+			const account = accountsCheck.accounts[workspaceId];
+			if (account) return account.account.account_id;
+		}
+		return null;
+	}
+	function getFileAttachmentNames(message) {
+		return (message.metadata?.attachments ?? []).filter((attachment) => attachment.name && !attachment.mime_type?.startsWith("image/")).map((attachment) => attachment.name);
+	}
+	function shouldSkipMessageInExport(message) {
+		if (!message || !message.content) return true;
+		if (message.recipient !== "all") return true;
+		if (message.content.content_type === "thoughts") return true;
+		if (message.content.content_type === "reasoning_recap") return true;
+		if (message.metadata?.is_visually_hidden_from_conversation) return true;
+		if (message.metadata?.is_thinking_preamble_message) return true;
+		if (message.author.role === "assistant" && message.content.content_type === "text" && !message.content.parts.join("").trim()) return true;
+		if (message.author.role === "tool") {
+			if (message.author.name === "file_search") return true;
+			const hasExecutionImages = message.content.content_type === "execution_output" && !!message.metadata?.aggregate_result?.messages?.some((msg) => msg.message_type === "image");
+			const hasMultimodalImage = message.content.content_type === "multimodal_text" && message.content.parts.some((part) => {
+				return typeof part !== "string" && part.content_type === "image_asset_pointer";
+			});
+			if (!hasExecutionImages && !hasMultimodalImage) return true;
+		}
+		return false;
+	}
+	function selectAnswer(conversation, messageIds) {
+		const ids = new Set(messageIds);
+		const nodes = conversation.conversationNodes;
+		const selected = nodes.filter((node) => ids.has(node.id) || ids.has(node.message?.id ?? "") || node.mergedIds?.some((id) => ids.has(id)));
+		const first = selected[0];
+		const answers = nodes.filter((node) => node.message?.author.role === "assistant" && !shouldSkipMessageInExport(node.message));
+		return {
+			...conversation,
+			conversationNodes: selected,
+			answerIndex: first ? answers.indexOf(first) + 1 : 0
+		};
+	}
+	function processConversation(conversation, options) {
+		const title = conversation.title || "ChatGPT Conversation";
+		const createTime = conversation.create_time;
+		const updateTime = conversation.update_time;
+		const startNodeId = conversation.current_node || Object.values(conversation.mapping).find((node) => !node.children || node.children.length === 0)?.id;
+		if (!startNodeId) throw new Error("Failed to find start node.");
+		const conversationNodes = extractConversationResult(conversation.mapping, startNodeId);
+		const { model, modelSlug } = extractModel(conversation.mapping, conversationNodes);
+		const mergedConversationNodes = mergeContinuationNodes(conversationNodes);
+		attachCitedSources(conversation.mapping, startNodeId, mergedConversationNodes);
+		if (options?.enableThinking) attachThinkingToNodes(conversation.mapping, mergedConversationNodes, startNodeId);
+		return {
+			id: conversation.id,
+			title,
+			model,
+			modelSlug,
+			createTime,
+			updateTime,
+			conversationNodes: mergedConversationNodes
+		};
+	}
+	function extractModel(conversationMapping, conversationNodes) {
+		const modelSlug = (conversationNodes.findLast((node) => node.message?.metadata?.model_slug) ?? Object.values(conversationMapping).find((node) => node.message?.metadata?.model_slug))?.message?.metadata?.model_slug ?? "";
+		return {
+			model: getModelName(modelSlug),
+			modelSlug
+		};
+	}
+	function extractConversationResult(conversationMapping, startNodeId) {
+		const result = [];
+		let currentNodeId = startNodeId;
+		while (currentNodeId) {
+			const node = conversationMapping[currentNodeId];
+			if (!node) break;
+			if (node.parent === void 0) break;
+			if (node.message?.author.role !== "system" && node.message?.content.content_type !== "model_editable_context" && node.message?.content.content_type !== "user_editable_context" && !shouldSkipMessageInExport(node.message)) result.unshift(copyNode(node));
+			currentNodeId = node.parent;
+		}
+		return result;
+	}
+	var CiteTagRegex = /<Cite\s+refs=\{\[([^\]]*)\]\}/g;
+	var CiteMarkerRegex = /\uE200cite((?:\uE202[^\uE200\uE201]*)+)\uE201/gu;
+	function extractCiteRefs(text) {
+		const refs = [];
+		for (const [, list] of text.matchAll(CiteTagRegex)) for (const [, ref] of list.matchAll(/"([^"]+)"/g)) refs.push(ref);
+		for (const [, list] of text.matchAll(CiteMarkerRegex)) refs.push(...list.split("").filter(Boolean));
+		return refs;
+	}
+	function cleanSourceUrl(url) {
+		return url.replace(/([?&])utm_source=chatgpt\.com(&|$)/, (_, lead, tail) => tail ? lead : "").replace(/[?&]$/, "");
+	}
+	function attachCitedSources(mapping, startNodeId, nodes) {
+		if (!nodes.some((node) => node.message?.metadata?.cite_refs?.length)) return;
+		const results = new Map();
+		for (let id = startNodeId; id && mapping[id]; id = mapping[id].parent) for (const group of mapping[id].message?.metadata?.search_result_groups ?? []) for (const { url, title, ref_id: ref } of group.entries ?? []) if (url && ref) results.set(`turn${ref.turn_index}${ref.ref_type}${ref.ref_index}`, {
+			url,
+			title
+		});
+		for (const { message } of nodes) {
+			const metadata = message?.metadata;
+			if (!metadata?.cite_refs?.length) continue;
+			const seen = new Set();
+			const sources = [];
+			for (const ref of metadata.cite_refs) {
+				const result = results.get(ref);
+				if (!result) continue;
+				const url = cleanSourceUrl(result.url);
+				if (seen.has(url)) continue;
+				seen.add(url);
+				sources.push({
+					title: result.title?.trim() || void 0,
+					url
+				});
+			}
+			if (sources.length) metadata.cited_sources = sources;
+			delete metadata.cite_refs;
+		}
+	}
+	function copyNode(node) {
+		const { message } = node;
+		if (!message) return { ...node };
+		const content = message.content.content_type === "text" ? {
+			...message.content,
+			parts: getInteractiveFallbackParts(message) ?? [...message.content.parts]
+		} : message.content;
+		const citeRefs = message.author.role === "assistant" && message.content.content_type === "text" ? extractCiteRefs(message.content.parts.join("\n")) : [];
+		return {
+			...node,
+			message: {
+				...message,
+				content,
+				metadata: message.metadata && {
+					...message.metadata,
+					...citeRefs.length ? { cite_refs: citeRefs } : {}
+				}
+			}
+		};
+	}
+	function getInteractiveFallbackParts(message) {
+		const dil = message.metadata?.model_dil_v2;
+		if (!dil || message.content.content_type !== "text") return null;
+		const markup = message.content.parts.join("");
+		const leading = markup.slice(0, markup.length - markup.trimStart().length);
+		const trailing = markup.slice(markup.trimEnd().length);
+		const markdown = typeof dil.fallbackMarkdown === "string" && !!dil.fallbackMarkdown.trim() && !dil.recoveryDiagnostics?.length && !hasRuntimeTemplates(markup) ? dil.fallbackMarkdown.replaceAll(/<escape>([\s\S]*?)<\/escape>/g, "$1") : dilToMarkdown(markup);
+		if (!markdown.trim()) return null;
+		return [leading + markdown + trailing];
+	}
+	function mergeContinuationNodes(nodes) {
+		const result = [];
+		for (const node of nodes) {
+			const prevNode = result[result.length - 1];
+			if (prevNode?.message?.author.role === "assistant" && node.message?.author.role === "assistant" && prevNode.message.recipient === "all" && node.message.recipient === "all" && prevNode.message.content.content_type === "text" && node.message.content.content_type === "text") {
+				const separator = prevNode.message.channel !== node.message.channel ? "\n\n" : "";
+				prevNode.message.content.parts[prevNode.message.content.parts.length - 1] += separator + node.message.content.parts[0];
+				prevNode.message.content.parts.push(...node.message.content.parts.slice(1));
+				prevNode.mergedIds ??= [];
+				prevNode.mergedIds.push(node.id);
+				if (node.message.metadata) {
+					const prevMeta = prevNode.message.metadata ??= {};
+					if (node.message.metadata.citations?.length) prevMeta.citations = [...prevMeta.citations || [], ...node.message.metadata.citations];
+					if (node.message.metadata.cite_refs?.length) prevMeta.cite_refs = [...prevMeta.cite_refs || [], ...node.message.metadata.cite_refs];
+					if (node.message.metadata.content_references?.length) prevMeta.content_references = [...prevMeta.content_references || [], ...node.message.metadata.content_references];
+				}
+			} else result.push(node);
+		}
+		return result;
+	}
+	function hasThinkingContent(thinking) {
+		return thinking.thoughts.length > 0 || thinking.activities != null && thinking.activities.length > 0;
+	}
+	function attachThinkingToNodes(mapping, resultNodes, startNodeId) {
+		const resultNodeIds = new Set(resultNodes.map((n) => n.id));
+		let currentNodeId = startNodeId;
+		let targetNodeId = null;
+		let thinking = { thoughts: [] };
+		while (currentNodeId) {
+			const node = mapping[currentNodeId];
+			if (!node || node.parent === void 0) break;
+			const message = node.message;
+			if (message?.content) {
+				const ct = message.content.content_type;
+				if (resultNodeIds.has(node.id) && message.author.role !== "user") {
+					if (hasThinkingContent(thinking)) {
+						const saveToId = targetNodeId ?? node.id;
+						const target = resultNodes.find((n) => n.id === saveToId);
+						if (target) target.thinking = thinking;
+					}
+					targetNodeId = node.id;
+					thinking = { thoughts: [] };
+				} else if (ct === "reasoning_recap") {
+					const duration = message.metadata?.finished_duration_sec;
+					if (typeof duration === "number") thinking.durationSeconds = duration;
+					else {
+						const match = message.content.content.match(/(\d+)/);
+						if (match) thinking.durationSeconds = Number.parseInt(match[1]);
+					}
+				} else if (ct === "thoughts") thinking.thoughts.unshift(...message.content.thoughts.filter((thought) => thought.content || thought.summary).map((thought) => ({
+					summary: thought.summary,
+					content: thought.content
+				})));
+				else if (ct === "text" && message.metadata?.is_thinking_preamble_message) {
+					const content = message.content.parts.join("\n");
+					if (content) thinking.thoughts.unshift({
+						summary: "",
+						content
+					});
+				} else if (message.metadata?.reasoning_title) {
+					if (!thinking.activities) thinking.activities = [];
+					const title = message.metadata.reasoning_title;
+					const index = thinking.activities.indexOf(title);
+					if (index !== -1) thinking.activities.splice(index, 1);
+					thinking.activities.unshift(title);
+				} else if (message.author.role === "user" && !message.metadata?.is_visually_hidden_from_conversation) {
+					if (targetNodeId && hasThinkingContent(thinking)) {
+						const target = resultNodes.find((n) => n.id === targetNodeId);
+						if (target) target.thinking = thinking;
+					}
+					targetNodeId = null;
+					thinking = { thoughts: [] };
+				}
+			}
+			currentNodeId = node.parent;
+		}
+		if (targetNodeId && hasThinkingContent(thinking)) {
+			const target = resultNodes.find((n) => n.id === targetNodeId);
+			if (target) target.thinking = thinking;
+		}
+	}
+	var ANSWER_ACTIONS_SELECTOR = "[data-talvt-turn-state] .turn-action-controls";
+	var MESSAGE_BLOCK_SELECTOR = "[data-chatgpt-search-message-ids]";
+	var ASSISTANT_ROLE_SELECTOR = "[data-conversation-role=\"assistant\"]";
+	function getAnswerMessageIds(actions) {
+		if (actions.closest(MESSAGE_BLOCK_SELECTOR)) return [];
+		const turn = actions.closest("[data-talvt-turn-state]");
+		if (!turn) return [];
+		const ids = [];
+		turn.querySelectorAll(MESSAGE_BLOCK_SELECTOR).forEach((block) => {
+			if (!block.querySelector(`:scope > ${ASSISTANT_ROLE_SELECTOR}`)) return;
+			if (block.parentElement?.closest(MESSAGE_BLOCK_SELECTOR)) return;
+			ids.push(...(block.getAttribute("data-chatgpt-search-message-ids") ?? "").split(/\s+/).filter(Boolean));
+		});
+		return [...new Set(ids)];
+	}
+	function getLastActionButton(actions) {
+		const buttons = actions.querySelectorAll("button:not([data-ce-answer-export])");
+		return buttons.item(buttons.length - 1);
+	}
+	function readButtonLook(button) {
+		const attributes = {};
+		for (const { name, value } of Array.from(button.attributes)) if (name.startsWith("data-") && name !== "data-state") attributes[name] = value;
+		return {
+			className: button.className,
+			innerClassName: button.firstElementChild?.className ?? "",
+			attributes
+		};
+	}
+	var t$1;
+	var r;
+	var u;
+	var i;
+	var o$1 = 0;
+	var f = [];
+	var c = [];
+	var e = l$1.__b;
+	var a = l$1.__r;
+	var v = l$1.diffed;
+	var l = l$1.__c;
+	var m = l$1.unmount;
+	function d(t, u) {
+		l$1.__h && l$1.__h(r, t, o$1 || u), o$1 = 0;
+		var i = r.__H || (r.__H = {
+			__: [],
+			__h: []
+		});
+		return t >= i.__.length && i.__.push({ __V: c }), i.__[t];
+	}
+	function h(n) {
+		return o$1 = 1, s(B$1, n);
+	}
+	function s(n, u, i) {
+		var o = d(t$1++, 2);
+		if (o.t = n, !o.__c && (o.__ = [i ? i(u) : B$1(void 0, u), function(n) {
+			var t = o.__N ? o.__N[0] : o.__[0], r = o.t(t, n);
+			t !== r && (o.__N = [r, o.__[1]], o.__c.setState({}));
+		}], o.__c = r, !r.u)) {
+			var f = function(n, t, r) {
+				if (!o.__c.__H) return !0;
+				var u = o.__c.__H.__.filter(function(n) {
+					return n.__c;
+				});
+				if (u.every(function(n) {
+					return !n.__N;
+				})) return !c || c.call(this, n, t, r);
+				var i = !1;
+				return u.forEach(function(n) {
+					if (n.__N) {
+						var t = n.__[0];
+						n.__ = n.__N, n.__N = void 0, t !== n.__[0] && (i = !0);
+					}
+				}), !(!i && o.__c.props === n) && (!c || c.call(this, n, t, r));
+			};
+			r.u = !0;
+			var c = r.shouldComponentUpdate, e = r.componentWillUpdate;
+			r.componentWillUpdate = function(n, t, r) {
+				if (this.__e) {
+					var u = c;
+					c = void 0, f(n, t, r), c = u;
+				}
+				e && e.call(this, n, t, r);
+			}, r.shouldComponentUpdate = f;
+		}
+		return o.__N || o.__;
+	}
+	function p(u, i) {
+		var o = d(t$1++, 3);
+		!l$1.__s && z$1(o.__H, i) && (o.__ = u, o.i = i, r.__H.__h.push(o));
+	}
+	function y(u, i) {
+		var o = d(t$1++, 4);
+		!l$1.__s && z$1(o.__H, i) && (o.__ = u, o.i = i, r.__h.push(o));
+	}
+	function _$1(n) {
+		return o$1 = 5, F$1(function() {
+			return { current: n };
+		}, []);
+	}
+	function F$1(n, r) {
+		var u = d(t$1++, 7);
+		return z$1(u.__H, r) ? (u.__V = n(), u.i = r, u.__h = n, u.__V) : u.__;
+	}
+	function T$1(n, t) {
+		return o$1 = 8, F$1(function() {
+			return n;
+		}, t);
+	}
+	function q$1(n) {
+		var u = r.context[n.__c], i = d(t$1++, 9);
+		return i.c = n, u ? (i.__ ?? (i.__ = !0, u.sub(r)), u.props.value) : n.__;
+	}
+	function V$1() {
+		var n = d(t$1++, 11);
+		if (!n.__) {
+			for (var u = r.__v; null !== u && !u.__m && null !== u.__;) u = u.__;
+			var i = u.__m || (u.__m = [0, 0]);
+			n.__ = "P" + i[0] + "-" + i[1]++;
+		}
+		return n.__;
+	}
+	function b() {
+		for (var t; t = f.shift();) if (t.__P && t.__H) try {
+			t.__H.__h.forEach(k), t.__H.__h.forEach(w$1), t.__H.__h = [];
+		} catch (r) {
+			t.__H.__h = [], l$1.__e(r, t.__v);
+		}
+	}
+	l$1.__b = function(n) {
+		r = null, e && e(n);
+	}, l$1.__r = function(n) {
+		a && a(n), t$1 = 0;
+		var i = (r = n.__c).__H;
+		i && (u === r ? (i.__h = [], r.__h = [], i.__.forEach(function(n) {
+			n.__N && (n.__ = n.__N), n.__V = c, n.__N = n.i = void 0;
+		})) : (i.__h.forEach(k), i.__h.forEach(w$1), i.__h = [], t$1 = 0)), u = r;
+	}, l$1.diffed = function(t) {
+		v && v(t);
+		var o = t.__c;
+		o && o.__H && (o.__H.__h.length && (1 !== f.push(o) && i === l$1.requestAnimationFrame || ((i = l$1.requestAnimationFrame) || j$1)(b)), o.__H.__.forEach(function(n) {
+			n.i && (n.__H = n.i), n.__V !== c && (n.__ = n.__V), n.i = void 0, n.__V = c;
+		})), u = r = null;
+	}, l$1.__c = function(t, r) {
+		r.some(function(t) {
+			try {
+				t.__h.forEach(k), t.__h = t.__h.filter(function(n) {
+					return !n.__ || w$1(n);
+				});
+			} catch (u) {
+				r.some(function(n) {
+					n.__h && (n.__h = []);
+				}), r = [], l$1.__e(u, t.__v);
+			}
+		}), l && l(t, r);
+	}, l$1.unmount = function(t) {
+		m && m(t);
+		var r, u = t.__c;
+		u && u.__H && (u.__H.__.forEach(function(n) {
+			try {
+				k(n);
+			} catch (n) {
+				r = n;
+			}
+		}), u.__H = void 0, r && l$1.__e(r, u.__v));
+	};
+	var g$1 = "function" == typeof requestAnimationFrame;
+	function j$1(n) {
+		var t, r = function() {
+			clearTimeout(u), g$1 && cancelAnimationFrame(t), setTimeout(n);
+		}, u = setTimeout(r, 100);
+		g$1 && (t = requestAnimationFrame(r));
+	}
+	function k(n) {
+		var t = r, u = n.__c;
+		"function" == typeof u && (n.__c = void 0, u()), r = t;
+	}
+	function w$1(n) {
+		var t = r;
+		n.__c = n.__(), r = t;
+	}
+	function z$1(n, t) {
+		return !n || n.length !== t.length || t.some(function(t, r) {
+			return t !== n[r];
+		});
+	}
+	function B$1(n, t) {
+		return "function" == typeof t ? t(n) : t;
+	}
+	function g(n, t) {
+		for (var e in t) n[e] = t[e];
+		return n;
+	}
+	function C(n, t) {
+		for (var e in n) if ("__source" !== e && !(e in t)) return !0;
+		for (var r in t) if ("__source" !== r && n[r] !== t[r]) return !0;
+		return !1;
+	}
+	function E(n, t) {
+		return n === t && (0 !== n || 1 / n == 1 / t) || n != n && t != t;
+	}
+	function w(n) {
+		this.props = n;
+	}
+	(w.prototype = new b$1()).isPureReactComponent = !0, w.prototype.shouldComponentUpdate = function(n, t) {
+		return C(this.props, n) || C(this.state, t);
+	};
+	var R = l$1.__b;
+	l$1.__b = function(n) {
+		n.type && n.type.__f && n.ref && (n.props.ref = n.ref, n.ref = null), R && R(n);
+	};
+	"undefined" != typeof Symbol && Symbol.for;
+	var T = l$1.__e;
+	l$1.__e = function(n, t, e, r) {
+		if (n.then) {
+			for (var u, o = t; o = o.__;) if ((u = o.__c) && u.__c) return t.__e ?? (t.__e = e.__e, t.__k = e.__k), u.__c(n, t);
+		}
+		T(n, t, e, r);
+	};
+	var F = l$1.unmount;
+	function I(n, t, e) {
+		return n && (n.__c && n.__c.__H && (n.__c.__H.__.forEach(function(n) {
+			"function" == typeof n.__c && n.__c();
+		}), n.__c.__H = null), null != (n = g({}, n)).__c && (n.__c.__P === e && (n.__c.__P = t), n.__c = null), n.__k = n.__k && n.__k.map(function(n) {
+			return I(n, t, e);
+		})), n;
+	}
+	function L(n, t, e) {
+		return n && (n.__v = null, n.__k = n.__k && n.__k.map(function(n) {
+			return L(n, t, e);
+		}), n.__c && n.__c.__P === t && (n.__e && e.insertBefore(n.__e, n.__d), n.__c.__e = !0, n.__c.__P = e)), n;
+	}
+	function U() {
+		this.__u = 0, this.t = null, this.__b = null;
+	}
+	function D(n) {
+		var t = n.__.__c;
+		return t && t.__a && t.__a(n);
+	}
+	function V() {
+		this.u = null, this.o = null;
+	}
+	l$1.unmount = function(n) {
+		var t = n.__c;
+		t && t.__R && t.__R(), t && !0 === n.__h && (n.type = null), F && F(n);
+	}, (U.prototype = new b$1()).__c = function(n, t) {
+		var e = t.__c, r = this;
+		r.t ??= [], r.t.push(e);
+		var u = D(r.__v), o = !1, i = function() {
+			o || (o = !0, e.__R = null, u ? u(l) : l());
+		};
+		e.__R = i;
+		var l = function() {
+			if (!--r.__u) {
+				if (r.state.__a) {
+					var n = r.state.__a;
+					r.__v.__k[0] = L(n, n.__c.__P, n.__c.__O);
+				}
+				var t;
+				for (r.setState({ __a: r.__b = null }); t = r.t.pop();) t.forceUpdate();
+			}
+		}, c = !0 === t.__h;
+		r.__u++ || c || r.setState({ __a: r.__b = r.__v.__k[0] }), n.then(i, i);
+	}, U.prototype.componentWillUnmount = function() {
+		this.t = [];
+	}, U.prototype.render = function(n, e) {
+		if (this.__b) {
+			if (this.__v.__k) {
+				var r = document.createElement("div"), o = this.__v.__k[0].__c;
+				this.__v.__k[0] = I(this.__b, r, o.__O = o.__P);
+			}
+			this.__b = null;
+		}
+		var i = e.__a && y$1(k$1, null, n.fallback);
+		return i && (i.__h = null), [y$1(k$1, null, e.__a ? null : n.children), i];
+	};
+	var W = function(n, t, e) {
+		if (++e[1] === e[0] && n.o.delete(t), n.props.revealOrder && ("t" !== n.props.revealOrder[0] || !n.o.size)) for (e = n.u; e;) {
+			for (; e.length > 3;) e.pop()();
+			if (e[1] < e[0]) break;
+			n.u = e = e[2];
+		}
+	};
+	function P(n) {
+		return this.getChildContext = function() {
+			return n.context;
+		}, n.children;
+	}
+	function j(n) {
+		var e = this, r = n.i;
+		e.componentWillUnmount = function() {
+			D$1(null, e.l), e.l = null, e.i = null;
+		}, e.i && e.i !== r && e.componentWillUnmount(), e.l || (e.i = r, e.l = {
+			nodeType: 1,
+			parentNode: r,
+			childNodes: [],
+			appendChild: function(n) {
+				this.childNodes.push(n), e.i.appendChild(n);
+			},
+			insertBefore: function(n, t) {
+				this.childNodes.push(n), e.i.appendChild(n);
+			},
+			removeChild: function(n) {
+				this.childNodes.splice(this.childNodes.indexOf(n) >>> 1, 1), e.i.removeChild(n);
+			}
+		}), D$1(y$1(P, { context: e.context }, n.__v), e.l);
+	}
+	function z(n, e) {
+		var r = y$1(j, {
+			__v: n,
+			i: e
+		});
+		return r.containerInfo = e, r;
+	}
+	(V.prototype = new b$1()).__a = function(n) {
+		var t = this, e = D(t.__v), r = t.o.get(n);
+		return r[0]++, function(u) {
+			var o = function() {
+				t.props.revealOrder ? (r.push(u), W(t, n, r)) : u();
+			};
+			e ? e(o) : o();
+		};
+	}, V.prototype.render = function(n) {
+		this.u = null, this.o = new Map();
+		var t = C$1(n.children);
+		n.revealOrder && "b" === n.revealOrder[0] && t.reverse();
+		for (var e = t.length; e--;) this.o.set(t[e], this.u = [
+			1,
+			0,
+			this.u
+		]);
+		return n.children;
+	}, V.prototype.componentDidUpdate = V.prototype.componentDidMount = function() {
+		var n = this;
+		this.o.forEach(function(t, e) {
+			W(n, e, t);
+		});
+	};
+	var B = "undefined" != typeof Symbol && Symbol.for && Symbol.for("react.element") || 60103;
+	var H = /^(?:accent|alignment|arabic|baseline|cap|clip(?!PathU)|color|dominant|fill|flood|font|glyph(?!R)|horiz|image(!S)|letter|lighting|marker(?!H|W|U)|overline|paint|pointer|shape|stop|strikethrough|stroke|text(?!L)|transform|underline|unicode|units|v|vector|vert|word|writing|x(?!C))[A-Z]/;
+	var Z = /^on(Ani|Tra|Tou|BeforeInp|Compo)/;
+	var Y = /[A-Z0-9]/g;
+	var $ = "undefined" != typeof document;
+	var q = function(n) {
+		return ("undefined" != typeof Symbol && "symbol" == typeof Symbol() ? /fil|che|rad/ : /fil|che|ra/).test(n);
+	};
+	b$1.prototype.isReactComponent = {}, [
+		"componentWillMount",
+		"componentWillReceiveProps",
+		"componentWillUpdate"
+	].forEach(function(t) {
+		Object.defineProperty(b$1.prototype, t, {
+			configurable: !0,
+			get: function() {
+				return this["UNSAFE_" + t];
+			},
+			set: function(n) {
+				Object.defineProperty(this, t, {
+					configurable: !0,
+					writable: !0,
+					value: n
+				});
+			}
+		});
+	});
+	var K = l$1.event;
+	function Q() {}
+	function X() {
+		return this.cancelBubble;
+	}
+	function nn() {
+		return this.defaultPrevented;
+	}
+	l$1.event = function(n) {
+		return K && (n = K(n)), n.persist = Q, n.isPropagationStopped = X, n.isDefaultPrevented = nn, n.nativeEvent = n;
+	};
+	var en = {
+		enumerable: !1,
+		configurable: !0,
+		get: function() {
+			return this.class;
+		}
+	};
+	var rn = l$1.vnode;
+	l$1.vnode = function(n) {
+		"string" == typeof n.type && function(n) {
+			var t = n.props, e = n.type, u = {};
+			for (var o in t) {
+				var i = t[o];
+				if (!("value" === o && "defaultValue" in t && null == i || $ && "children" === o && "noscript" === e || "class" === o || "className" === o)) {
+					var l = o.toLowerCase();
+					"defaultValue" === o && "value" in t && null == t.value ? o = "value" : "download" === o && !0 === i ? i = "" : "ondoubleclick" === l ? o = "ondblclick" : "onchange" !== l || "input" !== e && "textarea" !== e || q(t.type) ? "onfocus" === l ? o = "onfocusin" : "onblur" === l ? o = "onfocusout" : Z.test(o) ? o = l : -1 === e.indexOf("-") && H.test(o) ? o = o.replace(Y, "-$&").toLowerCase() : null === i && (i = void 0) : l = o = "oninput", "oninput" === l && u[o = l] && (o = "oninputCapture"), u[o] = i;
+				}
+			}
+			"select" == e && u.multiple && Array.isArray(u.value) && (u.value = C$1(t.children).forEach(function(n) {
+				n.props.selected = -1 != u.value.indexOf(n.props.value);
+			})), "select" == e && null != u.defaultValue && (u.value = C$1(t.children).forEach(function(n) {
+				n.props.selected = u.multiple ? -1 != u.defaultValue.indexOf(n.props.value) : u.defaultValue == n.props.value;
+			})), t.class && !t.className ? (u.class = t.class, Object.defineProperty(u, "className", en)) : (t.className && !t.class || t.class && t.className) && (u.class = u.className = t.className), n.props = u;
+		}(n), n.$$typeof = B, rn && rn(n);
+	};
+	var un = l$1.__r;
+	l$1.__r = function(n) {
+		un && un(n), n.__c;
+	};
+	var on = l$1.diffed;
+	l$1.diffed = function(n) {
+		on && on(n);
+		var t = n.props, e = n.__e;
+		null != e && "textarea" === n.type && "value" in t && t.value !== e.value && (e.value = null == t.value ? "" : t.value);
+	};
+	function En(n, t) {
+		var e = t(), r = h({ h: {
+			__: e,
+			v: t
+		} }), u = r[0].h, o = r[1];
+		return y(function() {
+			u.__ = e, u.v = t, E(u.__, t()) || o({ h: u });
+		}, [
+			n,
+			e,
+			t
+		]), p(function() {
+			return E(u.__, u.v()) || o({ h: u }), n(function() {
+				E(u.__, u.v()) || o({ h: u });
+			});
+		}, [n]), e;
+	}
+	var en_default = {
+		title: "Super ChatGPT Exporter",
+		ExportHelper: "Export",
+		Setting: "Setting",
+		Language: "Language",
+		"Copy Text": "Copy Text",
+		"Copied!": "Copied!",
+		Screenshot: "Screenshot",
+		Markdown: "Markdown",
+		HTML: "HTML",
+		JSON: "JSON",
+		Archive: "Archive",
+		Save: "Save",
+		Delete: "Delete",
+		Cancel: "Cancel",
+		"Select All": "Select All",
+		"Select...": "Select...",
+		"Select Not Exported": "Select Not Exported",
+		"Select Updated": "Select Updated",
+		"Shift Select Hint": "Tip: Shift+click to select a range",
+		Export: "Export",
+		Error: "Error",
+		Loading: "Loading",
+		Preview: "Preview",
+		"File Name": "File Name",
+		"Export All": "Export All",
+		"Exporter Settings": "Exporter Settings",
+		"Export Dialog Title": "Export Conversations",
+		"Invalid File Format": "Invalid File Format",
+		"Export from official export file": "Export from official export file",
+		"Export from API": "Export from API",
+		"Available variables": "Available variables",
+		"Conversation Timestamp": "Conversation Timestamp",
+		"Conversation Timestamp Description": "Will show on the page.",
+		"Enable on HTML": "Enable on HTML files",
+		"Enable on Markdown": "Enable on Markdown files",
+		"Use 24-hour format": "Use 24-hour format (eg. 23:59)",
+		"Export Format": "Export Format",
+		"Export Metadata": "Export Metadata",
+		"Export Metadata Description": "Add metadata to exported Markdown and HTML files.",
+		"Export Thinking Process": "Export Thinking Process",
+		"Export Thinking Process Description": "Include the model's thinking/reasoning process in exported Markdown and HTML files.",
+		"Export Sources": "Export Sources",
+		"Export Sources Description": "Include the source list shown at the end of each answer in exported Markdown and HTML files.",
+		Images: "Images",
+		"Images Description": "How images are saved in Markdown and JSON (ZIP) exports. When left out, Markdown shows [image] instead. HTML always embeds images.",
+		"Images Embed": "Embed in the file (base64)",
+		"Images Omit": "Leave out images",
+		"Images Files": "Save as separate files (.zip)",
+		Sources: "Sources",
+		"OpenAI Official Format": "OpenAI Official Format",
+		"Conversation Archive Alert": "Are you sure you want to archive all selected conversations?",
+		"Conversation Archived Message": "All selected conversations have been archived. Please refresh the page to see the changes.",
+		"Conversation Delete Alert": "Are you sure you want to delete all selected conversations?",
+		"Conversation Deleted Message": "All selected conversations have been deleted. Please refresh the page to see the changes.",
+		"Please start a conversation first": "Please start a conversation first.",
+		"Temporary chat could not be captured": "This temporary chat could not be read. It may have started before the exporter was loaded. You can still export it as a PNG screenshot.",
+		"Select Project": "Select Project",
+		"(no project)": "(no project)",
+		"Export All Limit": "Export All Limit",
+		"Export All Limit Description": "Set the maximum number of conversations to load. Exports run in waves of 100 conversations to stay within API rate limits.",
+		"Select a source to load conversations": "Select a project above to load conversations.",
+		Search: "Search",
+		"No results": "No results",
+		"Batch progress": "Batch {{current}}/{{total}}",
+		"All conversations": "All conversations",
+		"Load more conversations": "Load {{n}} more",
+		"Load more conversations remaining": "Load {{n}} more · {{remaining}} left",
+		"Export Skipped Message": "{{n}} conversations failed after repeated retries and are missing from the export:",
+		"List Rate Limited Wait": "Rate limited by the API · wait {{n}}s and try again",
+		"List Rate Limited": "Rate limited by the API · try again in a moment",
+		"List Load Failed": "Failed to load conversations",
+		"Thought for {{seconds}} seconds": "Thought for {{seconds}} seconds",
+		Thinking: "Thinking",
+		"Download answer": "Download this answer",
+		"The answer could not be found": "The answer could not be found"
+	};
+	var es_default = {
+		title: "Super ChatGPT Exporter",
+		ExportHelper: "Exportar",
+		Setting: "Ajustes",
+		Language: "Idioma",
+		"Copy Text": "Copiar Texto",
+		"Copied!": "¡Copiado!",
+		Screenshot: "Captura",
+		Markdown: "Markdown",
+		HTML: "HTML",
+		JSON: "JSON",
+		Archive: "Archivo",
+		Save: "Guardar",
+		Delete: "Borrar",
+		Cancel: "Cancelar",
+		"Select All": "Seleccionar Todos",
+		"Select...": "Selección…",
+		"Select Not Exported": "Seleccionar conversaciones no exportadas",
+		"Select Updated": "Seleccionar conversaciones actualizadas",
+		"Shift Select Hint": "Consejo: Shift+clic para seleccionar un rango",
+		Export: "Exportar",
+		Error: "Error",
+		Loading: "Cargando",
+		Preview: "Previsualizar",
+		"File Name": "Nombre del Archivo",
+		"Export All": "Exportar Todos",
+		"Exporter Settings": "Ajustes De Exportación",
+		"Export Dialog Title": "Exportar Conversaciones",
+		"Invalid File Format": "Formato de archivo inválido",
+		"Export from official export file": "Exportar desde archivo de exportación oficial",
+		"Export from API": "Exportar desde API",
+		"Available variables": "Variables Disponibles",
+		"Conversation Timestamp": "Marca de Tiempo",
+		"Conversation Timestamp Description": "Aparecerá en la página.",
+		"Enable on HTML": "Habilitar en archivos HTML",
+		"Enable on Markdown": "Habilitar en archivos Markdown",
+		"Use 24-hour format": "Usar formato de 24 horas (ej. 23:59)",
+		"Export Format": "Formato de Exportación",
+		"Export Metadata": "Exportar Metadatos",
+		"Export Metadata Description": "Añadir Metadatos a los archivos Markdown y HTML exportados.",
+		"Export Thinking Process": "Exportar Proceso de Pensamiento",
+		"Export Thinking Process Description": "Incluir el proceso de pensamiento/razonamiento del modelo en los archivos Markdown y HTML exportados.",
+		"Export Sources": "Exportar fuentes",
+		"Export Sources Description": "Incluir la lista de fuentes que se muestra al final de cada respuesta en los archivos Markdown y HTML exportados.",
+		Images: "Imágenes",
+		"Images Description": "Cómo se guardan las imágenes en las exportaciones Markdown y JSON (ZIP). Si se omiten, Markdown muestra [image] en su lugar. HTML siempre incrusta las imágenes.",
+		"Images Embed": "Incrustar en el archivo (base64)",
+		"Images Omit": "Omitir imágenes",
+		"Images Files": "Guardar como archivos separados (.zip)",
+		Sources: "Fuentes",
+		"OpenAI Official Format": "Formato Oficial de OpenAI",
+		"Conversation Archive Alert": "¿Estás seguro que quieres archivar todas las conversaciones seleccionadas?",
+		"Conversation Archived Message": "Todos las conversaciones seleccionadas se han archivado. Por favor refresca la página para ver los cambios.",
+		"Conversation Delete Alert": "¿Estás seguro que quieres borrar todas las conversaciones seleccionadas?",
+		"Conversation Deleted Message": "Todos las conversaciones seleccionadas se han borrado. Por favor refresca la página para ver los cambios.",
+		"Please start a conversation first": "Por favor empieza una conversación antes.",
+		"Temporary chat could not be captured": "No se pudo leer este chat temporal. Es posible que haya comenzado antes de que se cargara el exportador. Aún puedes exportarlo como una captura de pantalla PNG.",
+		"Select Project": "Seleccionar proyecto",
+		"(no project)": "(sin proyecto)",
+		"Export All Limit": "Límite de Exportar Todos",
+		"Export All Limit Description": "Establece el número máximo de conversaciones a cargar en el diálogo 'Exportar Todos'.",
+		"Select a source to load conversations": "Selecciona un proyecto arriba para cargar conversaciones.",
+		Search: "Buscar",
+		"No results": "Sin resultados",
+		"Batch progress": "Lote {{current}}/{{total}}",
+		"All conversations": "Todas las conversaciones",
+		"Load more conversations": "Cargar {{n}} más",
+		"Load more conversations remaining": "Cargar {{n}} más · quedan {{remaining}}",
+		"Export Skipped Message": "{{n}} conversaciones fallaron tras varios reintentos y no están en la exportación:",
+		"List Rate Limited Wait": "Límite de solicitudes de la API · espera {{n}} s y vuelve a intentarlo",
+		"List Rate Limited": "Límite de solicitudes de la API · vuelve a intentarlo en un momento",
+		"List Load Failed": "No se pudieron cargar las conversaciones",
+		"Thought for {{seconds}} seconds": "Pensó durante {{seconds}} segundos",
+		Thinking: "Pensando",
+		"Download answer": "Descargar esta respuesta",
+		"The answer could not be found": "No se encontró la respuesta"
+	};
+	var fr_default = {
+		title: "Super ChatGPT Exporter",
+		ExportHelper: "Exporter",
+		Setting: "Paramètre",
+		Language: "Langue",
+		"Copy Text": "Copier le texte",
+		"Copied!": "Copié !",
+		Screenshot: "Capture",
+		Markdown: "Markdown",
+		HTML: "HTML",
+		JSON: "JSON",
+		Archive: "Archiver",
+		Save: "Enregistrer",
+		Delete: "Supprimer",
+		Cancel: "Annuler",
+		"Select All": "Tout sélectionner",
+		"Select...": "Sélection…",
+		"Select Not Exported": "Sélectionner les conversations non exportées",
+		"Select Updated": "Sélectionner les conversations mises à jour",
+		"Shift Select Hint": "Astuce : Maj+clic pour sélectionner une plage",
+		Export: "Exporter",
+		Error: "Erreur",
+		Loading: "Chargement",
+		Preview: "Aperçu",
+		"File Name": "Nom du fichier",
+		"Export All": "Tout exporter",
+		"Exporter Settings": "Paramètres de l'exportateur",
+		"Export Dialog Title": "Exporter les conversations",
+		"Invalid File Format": "Format de fichier invalide",
+		"Export from official export file": "Exporter depuis un fichier officiel",
+		"Export from API": "Exporter depuis l'API",
+		"Available variables": "Variables disponibles",
+		"Conversation Timestamp": "Horodatage de la conversation",
+		"Conversation Timestamp Description": "S'affichera sur la page.",
+		"Enable on HTML": "Activer sur les fichiers HTML",
+		"Enable on Markdown": "Activer sur les fichiers Markdown",
+		"Use 24-hour format": "Utiliser le format 24 heures (ex. 23:59)",
+		"Export Format": "Format d'exportation",
+		"Export Metadata": "Exporter les métadonnées",
+		"Export Metadata Description": "Ajouter des métadonnées aux fichiers Markdown et HTML exportés.",
+		"Export Thinking Process": "Exporter le processus de réflexion",
+		"Export Thinking Process Description": "Inclure le processus de réflexion/raisonnement du modèle dans les fichiers Markdown et HTML exportés.",
+		"Export Sources": "Exporter les sources",
+		"Export Sources Description": "Inclure la liste des sources affichée à la fin de chaque réponse dans les fichiers Markdown et HTML exportés.",
+		Images: "Images",
+		"Images Description": "Comment les images sont enregistrées dans les exports Markdown et JSON (ZIP). Si elles sont omises, Markdown affiche [image] à la place. HTML intègre toujours les images.",
+		"Images Embed": "Intégrer dans le fichier (base64)",
+		"Images Omit": "Omettre les images",
+		"Images Files": "Enregistrer en fichiers séparés (.zip)",
+		Sources: "Sources",
+		"OpenAI Official Format": "Format officiel OpenAI",
+		"Conversation Archive Alert": "Êtes-vous sûr de vouloir archiver toutes les conversations sélectionnées ?",
+		"Conversation Archived Message": "Toutes les conversations sélectionnées ont été archivées. Veuillez actualiser la page pour voir les changements.",
+		"Conversation Delete Alert": "Êtes-vous sûr de vouloir supprimer toutes les conversations sélectionnées ?",
+		"Conversation Deleted Message": "Toutes les conversations sélectionnées ont été supprimées. Veuillez actualiser la page pour voir les changements.",
+		"Please start a conversation first": "Veuillez commencer une conversation d'abord.",
+		"Temporary chat could not be captured": "Ce chat éphémère n'a pas pu être lu. Il a peut-être commencé avant le chargement de l'exportateur. Vous pouvez toujours l'exporter en capture d'écran PNG.",
+		"Select Project": "Sélectionner un projet",
+		"(no project)": "(aucun projet)",
+		"Export All Limit": "Limite d'Exportation Multiple",
+		"Export All Limit Description": "Définit le nombre maximal de conversations à charger dans la boîte de dialogue 'Tout exporter'.",
+		"Select a source to load conversations": "Sélectionnez un projet ci-dessus pour charger les conversations.",
+		Search: "Rechercher",
+		"No results": "Aucun résultat",
+		"Batch progress": "Lot {{current}}/{{total}}",
+		"All conversations": "Toutes les conversations",
+		"Load more conversations": "Charger {{n}} de plus",
+		"Load more conversations remaining": "Charger {{n}} de plus · {{remaining}} restantes",
+		"Export Skipped Message": "{{n}} conversations ont échoué après plusieurs tentatives et ne figurent pas dans l'export :",
+		"List Rate Limited Wait": "Limite de requêtes de l'API atteinte · attendez {{n}} s et réessayez",
+		"List Rate Limited": "Limite de requêtes de l'API atteinte · réessayez dans un instant",
+		"List Load Failed": "Impossible de charger les conversations",
+		"Thought for {{seconds}} seconds": "Réflexion pendant {{seconds}} secondes",
+		Thinking: "Réflexion",
+		"Download answer": "Télécharger cette réponse",
+		"The answer could not be found": "Réponse introuvable"
+	};
+	var id_default = {
+		title: "Super ChatGPT Exporter",
+		ExportHelper: "Ekspor",
+		Setting: "Pengaturan",
+		Language: "Bahasa",
+		"Copy Text": "Salin Teks",
+		"Copied!": "Disalin!",
+		Screenshot: "Screenshot",
+		Markdown: "Markdown",
+		HTML: "HTML",
+		JSON: "JSON",
+		Archive: "Arsip",
+		Save: "Simpan",
+		Delete: "Hapus",
+		Cancel: "Batal",
+		"Select All": "Pilih Semua",
+		"Select...": "Pilih massal…",
+		"Select Not Exported": "Pilih percakapan yang belum diekspor",
+		"Select Updated": "Pilih percakapan yang diperbarui",
+		"Shift Select Hint": "Tips: Shift+klik untuk memilih rentang",
+		Export: "Ekspor",
+		Error: "Kesalahan",
+		Loading: "Memuat",
+		Preview: "Pratinjau",
+		"File Name": "Nama File",
+		"Export All": "Ekspor Semua",
+		"Exporter Settings": "Pengaturan Pengekspor",
+		"Export Dialog Title": "Ekspor Percakapan",
+		"Invalid File Format": "Format File Tidak Valid",
+		"Export from official export file": "Ekspor dari file ekspor resmi",
+		"Export from API": "Ekspor dari API",
+		"Available variables": "Variabel yang Tersedia",
+		"Conversation Timestamp": "Timestamp Percakapan",
+		"Conversation Timestamp Description": "Akan ditampilkan pada halaman.",
+		"Enable on HTML": "Aktifkan pada file HTML",
+		"Enable on Markdown": "Aktifkan pada file Markdown",
+		"Use 24-hour format": "Gunakan format 24 jam (contohnya: 23:59)",
+		"Export Format": "Format Ekspor",
+		"Export Metadata": "Ekspor Metada",
+		"Export Metadata Description": "Tambahkan metadata ke file Markdown dan HTML yang diekspor.",
+		"Export Thinking Process": "Ekspor Proses Berpikir",
+		"Export Thinking Process Description": "Sertakan proses berpikir/penalaran model dalam file Markdown dan HTML yang diekspor.",
+		"Export Sources": "Ekspor Sumber",
+		"Export Sources Description": "Sertakan daftar sumber yang ditampilkan di akhir setiap jawaban dalam file Markdown dan HTML yang diekspor.",
+		Images: "Gambar",
+		"Images Description": "Cara gambar disimpan dalam ekspor Markdown dan JSON (ZIP). Jika dihilangkan, Markdown menampilkan [image] sebagai gantinya. HTML selalu menyematkan gambar.",
+		"Images Embed": "Sematkan di file (base64)",
+		"Images Omit": "Hilangkan gambar",
+		"Images Files": "Simpan sebagai file terpisah (.zip)",
+		Sources: "Sumber",
+		"OpenAI Official Format": "Format Resmi OpenAI",
+		"Conversation Archive Alert": "Apakah Anda yakin ingin mengarsipkan semua percakapan yang dipilih?",
+		"Conversation Archived Message": "Semua percakapan yang dipilih telah diarsipkan. Harap segarkan halaman untuk melihat perubahan.",
+		"Conversation Delete Alert": "Apakah Anda yakin ingin menghapus semua percakapan yang dipilih?",
+		"Conversation Deleted Message": "Semua percakapan yang dipilih telah dihapus. Harap segarkan halaman untuk melihat perubahan.",
+		"Please start a conversation first": "Harap mulai percakapan terlebih dahulu.",
+		"Temporary chat could not be captured": "Obrolan sementara ini tidak dapat dibaca. Mungkin obrolan dimulai sebelum pengekspor dimuat. Anda masih dapat mengekspornya sebagai tangkapan layar PNG.",
+		"Select Project": "Pilih Proyek",
+		"(no project)": "(tidak ada proyek)",
+		"Export All Limit": "Batas Ekspor Semua",
+		"Export All Limit Description": "Atur jumlah maksimum percakapan yang akan dimuat dalam dialog 'Ekspor Semua'.",
+		"Select a source to load conversations": "Pilih proyek di atas untuk memuat percakapan.",
+		Search: "Cari",
+		"No results": "Tidak ada hasil",
+		"Batch progress": "Kelompok {{current}}/{{total}}",
+		"All conversations": "Semua percakapan",
+		"Load more conversations": "Muat {{n}} lagi",
+		"Load more conversations remaining": "Muat {{n}} lagi · tersisa {{remaining}}",
+		"Export Skipped Message": "{{n}} percakapan gagal setelah beberapa kali dicoba ulang dan tidak ada dalam ekspor:",
+		"List Rate Limited Wait": "Dibatasi oleh API · tunggu {{n}} dtk lalu coba lagi",
+		"List Rate Limited": "Dibatasi oleh API · coba lagi sebentar lagi",
+		"List Load Failed": "Gagal memuat percakapan",
+		"Thought for {{seconds}} seconds": "Berpikir selama {{seconds}} detik",
+		Thinking: "Berpikir",
+		"Download answer": "Unduh jawaban ini",
+		"The answer could not be found": "Jawaban tidak ditemukan"
+	};
+	var jp_default = {
+		title: "Super ChatGPT Exporter",
+		ExportHelper: "エクスポート",
+		Setting: "設定",
+		Language: "言語",
+		"Copy Text": "テキストをコピー",
+		"Copied!": "コピーしました！",
+		Screenshot: "キャプチャ",
+		Markdown: "Markdown",
+		HTML: "HTML",
+		JSON: "JSON",
+		Archive: "アーカイブ",
+		Save: "保存",
+		Delete: "削除",
+		Cancel: "キャンセル",
+		"Select All": "すべて選択",
+		"Select...": "一括選択…",
+		"Select Not Exported": "未エクスポートの会話を選択",
+		"Select Updated": "更新された会話を選択",
+		"Shift Select Hint": "ヒント: Shift+クリックで範囲選択",
+		Export: "エクスポート",
+		Error: "エラー",
+		Loading: "読み込み中",
+		Preview: "プレビュー",
+		"File Name": "ファイル名",
+		"Export All": "すべてエクスポート",
+		"Exporter Settings": "エクスポーター設定",
+		"Export Dialog Title": "会話をエクスポート",
+		"Invalid File Format": "無効なファイル形式",
+		"Export from official export file": "公式エクスポートファイルからエクスポートする",
+		"Export from API": "APIからエクスポートする",
+		"Available variables": "使用可能な変数",
+		"Conversation Timestamp": "会話のタイムスタンプ",
+		"Conversation Timestamp Description": "ページに表示されます。",
+		"Enable on HTML": "HTML ファイルで有効にする",
+		"Enable on Markdown": "Markdown ファイルで有効にする",
+		"Use 24-hour format": "24時間形式を使用する (例: 23:59)",
+		"Export Format": "エクスポートフォーマット",
+		"Export Metadata": "メタデータをエクスポート",
+		"Export Metadata Description": "エクスポートされたMarkdownおよびHTMLファイルにメタデータを追加します。",
+		"Export Thinking Process": "思考プロセスをエクスポート",
+		"Export Thinking Process Description": "エクスポートされたMarkdownおよびHTMLファイルにモデルの思考・推論プロセスを含めます。",
+		"Export Sources": "ソースをエクスポート",
+		"Export Sources Description": "各回答の末尾に表示されるソース一覧を、エクスポートされた Markdown および HTML ファイルに含めます。",
+		Images: "画像",
+		"Images Description": "Markdown と JSON (ZIP) のエクスポートでの画像の保存方法。省略した場合、Markdown では代わりに [image] と表示されます。HTML では常に画像が埋め込まれます。",
+		"Images Embed": "ファイルに埋め込む (base64)",
+		"Images Omit": "画像を省略",
+		"Images Files": "別ファイルとして保存 (.zip)",
+		Sources: "出典",
+		"OpenAI Official Format": "OpenAI公式フォーマット",
+		"Conversation Archive Alert": "選択したすべての会話をアーカイブしてもよろしいですか？",
+		"Conversation Archived Message": "選択したすべての会話がアーカイブされました。変更を表示するには、ページを更新してください。",
+		"Conversation Delete Alert": "選択したすべての会話を削除してもよろしいですか？",
+		"Conversation Deleted Message": "選択したすべての会話が削除されました。変更を表示するには、ページを更新してください。",
+		"Please start a conversation first": "まず会話を開始してください。",
+		"Temporary chat could not be captured": "この一時チャットを読み取れませんでした。エクスポーターが読み込まれる前に開始された可能性があります。PNG スクリーンショットとしてエクスポートすることは可能です。",
+		"Select Project": "プロジェクトを選択",
+		"(no project)": "（プロジェクトなし）",
+		"Export All Limit": "すべてエクスポートの上限",
+		"Export All Limit Description": "「すべてエクスポート」ダイアログで読み込む会話の最大数を設定します。",
+		"Select a source to load conversations": "上からプロジェクトを選択して会話を読み込んでください。",
+		Search: "検索",
+		"No results": "結果なし",
+		"Batch progress": "バッチ {{current}}/{{total}}",
+		"All conversations": "すべての会話",
+		"Load more conversations": "さらに {{n}} 件読み込む",
+		"Load more conversations remaining": "さらに {{n}} 件読み込む · 残り {{remaining}} 件",
+		"Export Skipped Message": "{{n}} 件の会話は再試行しても失敗したため、エクスポートに含まれていません：",
+		"List Rate Limited Wait": "リクエストが多すぎます · {{n}} 秒後に再試行してください",
+		"List Rate Limited": "リクエストが多すぎます · しばらくしてから再試行してください",
+		"List Load Failed": "会話を読み込めませんでした",
+		"Thought for {{seconds}} seconds": "{{seconds}} 秒間思考しました",
+		Thinking: "思考中",
+		"Download answer": "この回答をダウンロード",
+		"The answer could not be found": "回答が見つかりませんでした"
+	};
+	var ru_default = {
+		title: "Super ChatGPT Exporter",
+		ExportHelper: "Export",
+		Setting: "Параметры",
+		Language: "Язык",
+		"Copy Text": "Копировать текст",
+		"Copied!": "Скопировано!",
+		Screenshot: "Скриншот",
+		Markdown: "Markdown",
+		HTML: "HTML",
+		JSON: "JSON",
+		Archive: "Архивировать",
+		Save: "Сохранить",
+		Delete: "Удалить",
+		Cancel: "Отмена",
+		"Select All": "Выбрать все",
+		"Select...": "Выбрать…",
+		"Select Not Exported": "Выбрать неэкспортированные разговоры",
+		"Select Updated": "Выбрать обновлённые разговоры",
+		"Shift Select Hint": "Совет: Shift+клик выбирает диапазон",
+		Export: "Экспорт",
+		Error: "Ошибка",
+		Loading: "Загрузка",
+		Preview: "Предпросмотр",
+		"File Name": "Имя файла",
+		"Export All": "Экспортировать все",
+		"Exporter Settings": "Параметры экспорта",
+		"Export Dialog Title": "Экспортировать беседы",
+		"Invalid File Format": "Неверный формат файла",
+		"Export from official export file": "Экспорт из официального файла",
+		"Export from API": "Экспорт из API",
+		"Available variables": "Доступные переменные",
+		"Conversation Timestamp": "Временная метка разговора",
+		"Conversation Timestamp Description": "Будет отображаться на странице.",
+		"Enable on HTML": "Включить для HTML-файлов",
+		"Enable on Markdown": "Включить для файлов Markdown",
+		"Use 24-hour format": "Использовать 24-часовой формат (например, 23:59)",
+		"Export Format": "Формат экспорта",
+		"Export Metadata": "Экспорт метаданных",
+		"Export Metadata Description": "Добавляйте метаданные в экспортированные файлы Markdown и HTML.",
+		"Export Thinking Process": "Экспорт процесса мышления",
+		"Export Thinking Process Description": "Включить процесс мышления/рассуждения модели в экспортированные файлы Markdown и HTML.",
+		"Export Sources": "Экспорт источников",
+		"Export Sources Description": "Включить список источников, показанный в конце каждого ответа, в экспортированные файлы Markdown и HTML.",
+		Images: "Изображения",
+		"Images Description": "Как сохранять изображения при экспорте в Markdown и JSON (ZIP). Если изображения пропущены, в Markdown вместо них будет [image]. HTML всегда встраивает изображения.",
+		"Images Embed": "Встроить в файл (base64)",
+		"Images Omit": "Не включать изображения",
+		"Images Files": "Сохранить отдельными файлами (.zip)",
+		Sources: "Источники",
+		"OpenAI Official Format": "Официальный формат OpenAI",
+		"Conversation Archive Alert": "Вы уверены, что хотите архивировать все выбранные разговоры?",
+		"Conversation Archived Message": "Все выбранные разговоры были заархивированы. Пожалуйста, обновите страницу, чтобы увидеть изменения.",
+		"Conversation Delete Alert": "Вы уверены, что хотите удалить все выбранные разговоры?",
+		"Conversation Deleted Message": "Все выбранные разговоры были удалены. Пожалуйста, обновите страницу, чтобы увидеть изменения.",
+		"Please start a conversation first": "Пожалуйста, начните разговор первым.",
+		"Temporary chat could not be captured": "Не удалось прочитать этот временный чат. Возможно, он был начат до загрузки экспортёра. Вы всё ещё можете экспортировать его как PNG-скриншот.",
+		"Select Project": "Выберите проект",
+		"(no project)": "(нет проекта)",
+		"Export All Limit": "Лимит экспорта всех",
+		"Export All Limit Description": "Установите максимальное количество бесед для загрузки в диалоге 'Экспортировать все'.",
+		"Select a source to load conversations": "Выберите проект выше, чтобы загрузить беседы.",
+		Search: "Поиск",
+		"No results": "Нет результатов",
+		"Batch progress": "Партия {{current}}/{{total}}",
+		"All conversations": "Все разговоры",
+		"Load more conversations": "Загрузить ещё {{n}}",
+		"Load more conversations remaining": "Загрузить ещё {{n}} · осталось {{remaining}}",
+		"Export Skipped Message": "{{n}} разговоров не удалось загрузить после нескольких попыток, они отсутствуют в экспорте:",
+		"List Rate Limited Wait": "Слишком много запросов к API · подождите {{n}} с и попробуйте снова",
+		"List Rate Limited": "Слишком много запросов к API · попробуйте чуть позже",
+		"List Load Failed": "Не удалось загрузить беседы",
+		"Thought for {{seconds}} seconds": "Размышления: {{seconds}} с",
+		Thinking: "Размышление",
+		"Download answer": "Скачать этот ответ",
+		"The answer could not be found": "Ответ не найден"
+	};
+	var tr_default = {
+		title: "Super ChatGPT Exporter",
+		ExportHelper: "Dışa Aktar",
+		Setting: "Ayarlar",
+		Language: "Dil",
+		"Copy Text": "Metni Kopyala",
+		"Copied!": "Kopyalandı!",
+		Screenshot: "Ekran Alıntısı",
+		Markdown: "Markdown",
+		HTML: "HTML",
+		JSON: "JSON",
+		Archive: "Arşiv",
+		Save: "Kaydet",
+		Delete: "Sil",
+		Cancel: "İptal",
+		"Select All": "Tümünü Seç",
+		"Select...": "Toplu seçim…",
+		"Select Not Exported": "Dışa aktarılmamış konuşmaları seç",
+		"Select Updated": "Güncellenen konuşmaları seç",
+		"Shift Select Hint": "İpucu: Aralık seçmek için Shift+tık",
+		Export: "Dışa Aktar",
+		Error: "Hata",
+		Loading: "Yükleniyor",
+		Preview: "Önizleme",
+		"File Name": "Dosya Adı",
+		"Export All": "Tümünü Dışa Aktar",
+		"Exporter Settings": "Dışa Aktarma Ayarları",
+		"Export Dialog Title": "Konuşmaları Dışa Aktar",
+		"Invalid File Format": "Dosya Biçimi Geçersiz",
+		"Export from official export file": "Resmi dışa aktarma dosyasından dışa aktar",
+		"Export from API": "API'den dışa aktar",
+		"Available variables": "Kullanılabilir değişkenler",
+		"Conversation Timestamp": "Konuşma zaman bilgisi",
+		"Conversation Timestamp Description": "Sayfada gösterilir.",
+		"Enable on HTML": "HTML dosyalarında etkinleştir",
+		"Enable on Markdown": "Markdown dosyalarında etkinleştir",
+		"Use 24-hour format": "24 saat biçimini kullan (örn. 23:59)",
+		"Export Format": "Dışa Aktarma Formatı",
+		"Export Metadata": "Üst veriyi dışa aktar",
+		"Export Metadata Description": "Dışa aktarılan Markdown ve HTML dosyalarına üst veri ekle",
+		"Export Thinking Process": "Düşünme Sürecini Dışa Aktar",
+		"Export Thinking Process Description": "Dışa aktarılan Markdown ve HTML dosyalarına modelin düşünme/akıl yürütme sürecini dahil et.",
+		"Export Sources": "Kaynakları Dışa Aktar",
+		"Export Sources Description": "Her yanıtın sonunda gösterilen kaynak listesini dışa aktarılan Markdown ve HTML dosyalarına dahil et.",
+		Images: "Görseller",
+		"Images Description": "Markdown ve JSON (ZIP) dışa aktarımlarında görsellerin nasıl kaydedileceği. Görseller çıkarıldığında Markdown yerine [image] gösterir. HTML görselleri her zaman gömer.",
+		"Images Embed": "Dosyaya göm (base64)",
+		"Images Omit": "Görselleri çıkar",
+		"Images Files": "Ayrı dosyalar olarak kaydet (.zip)",
+		Sources: "Kaynaklar",
+		"OpenAI Official Format": "OpenAI Resmi Format",
+		"Conversation Archive Alert": "Seçilen tüm konuşmaları arşivlemek istediğinizden emin misiniz?",
+		"Conversation Archived Message": "Seçilen tüm konuşmalar arşivlendi. Değişiklikleri görmek için sayfayı yenileyin.",
+		"Conversation Delete Alert": "Seçilen tüm konuşmaları silmek istediğinizden emin misiniz?",
+		"Conversation Deleted Message": "Seçilen tüm konuşmalar silindi. Değişiklikleri görmek için sayfayı yenileyin.",
+		"Please start a conversation first": "Lütfen önce bir konuşma başlatın.",
+		"Temporary chat could not be captured": "Bu geçici sohbet okunamadı. Dışa aktarıcı yüklenmeden önce başlamış olabilir. Yine de PNG ekran görüntüsü olarak dışa aktarabilirsiniz.",
+		"Select Project": "Proje Seç",
+		"(no project)": "(proje yok)",
+		"Export All Limit": "Tümünü Dışa Aktarma Limiti",
+		"Export All Limit Description": "'Tümünü Dışa Aktar' iletişim kutusunda yüklenecek maksimum konuşma sayısını ayarlayın.",
+		"Select a source to load conversations": "Konuşmaları yüklemek için yukarıdan bir proje seçin.",
+		Search: "Ara",
+		"No results": "Sonuç yok",
+		"Batch progress": "Grup {{current}}/{{total}}",
+		"All conversations": "Tüm konuşmalar",
+		"Load more conversations": "{{n}} tane daha yükle",
+		"Load more conversations remaining": "{{n}} tane daha yükle · {{remaining}} kaldı",
+		"Export Skipped Message": "{{n}} konuşma tekrar denemelere rağmen başarısız oldu ve dışa aktarımda yer almıyor:",
+		"List Rate Limited Wait": "API istek sınırına ulaşıldı · {{n}} sn bekleyip tekrar deneyin",
+		"List Rate Limited": "API istek sınırına ulaşıldı · biraz sonra tekrar deneyin",
+		"List Load Failed": "Sohbetler yüklenemedi",
+		"Thought for {{seconds}} seconds": "{{seconds}} saniye düşündü",
+		Thinking: "Düşünüyor",
+		"Download answer": "Bu yanıtı indir",
+		"The answer could not be found": "Yanıt bulunamadı"
+	};
+	var zh_Hans_default = {
+		title: "Super ChatGPT Exporter",
+		ExportHelper: "导出助手-fix",
+		Setting: "设置",
+		Language: "语言",
+		"Copy Text": "复制文字",
+		"Copied!": "已复制!",
+		Screenshot: "截屏",
+		Markdown: "Markdown",
+		HTML: "HTML",
+		JSON: "JSON",
+		Archive: "归档",
+		Save: "保存",
+		Delete: "删除",
+		Cancel: "取消",
+		"Select All": "全选",
+		"Select...": "批量选择…",
+		"Select Not Exported": "选择未导出的对话",
+		"Select Updated": "选择有更新的对话",
+		"Shift Select Hint": "提示：Shift+点击可选择范围",
+		Export: "导出",
+		Error: "错误",
+		Loading: "加载中",
+		Preview: "预览",
+		"File Name": "文件名",
+		"Export All": "批量导出",
+		"Exporter Settings": "导出设置",
+		"Export Dialog Title": "导出对话",
+		"Invalid File Format": "无效的文件格式",
+		"Export from official export file": "从官方导出文件导出",
+		"Export from API": "从 API 导出",
+		"Available variables": "可用变量",
+		"Conversation Timestamp": "对话时间戳",
+		"Conversation Timestamp Description": "会显示在页面上。",
+		"Enable on HTML": "在 HTML 文件上启用",
+		"Enable on Markdown": "在 Markdown 文件上启用",
+		"Use 24-hour format": "使用24小时制 (例如 23:59)",
+		"Export Format": "导出格式",
+		"Export Metadata": "导出元数据",
+		"Export Metadata Description": "会添加至 Markdown 以及 HTML 导出。",
+		"Export Thinking Process": "导出思考过程",
+		"Export Thinking Process Description": "在导出的 Markdown 和 HTML 文件中包含模型的思考/推理过程。",
+		"Export Sources": "导出来源",
+		"Export Sources Description": "在导出的 Markdown 和 HTML 文件中包含每个回答末尾显示的来源列表。",
+		Images: "图片",
+		"Images Description": "Markdown 和 JSON (ZIP) 导出时图片的保存方式。省略时，Markdown 会以 [image] 代替。HTML 始终嵌入图片。",
+		"Images Embed": "嵌入文件 (base64)",
+		"Images Omit": "省略图片",
+		"Images Files": "另存为单独文件 (.zip)",
+		Sources: "来源",
+		"OpenAI Official Format": "OpenAI 官方格式",
+		"Conversation Archive Alert": "确定要归档所有选取的对话？",
+		"Conversation Archived Message": "所有所选的对话已归档。请刷新页面。",
+		"Conversation Delete Alert": "确定要删除所有选取的对话？",
+		"Conversation Deleted Message": "所有所选的对话已删除。请刷新页面。",
+		"Please start a conversation first": "请先开始对话。",
+		"Temporary chat could not be captured": "无法读取此临时聊天，它可能在导出工具加载前就已开始。你仍可以将其导出为 PNG 截图。",
+		"Select Project": "选择项目",
+		"(no project)": "（无项目）",
+		"Export All Limit": "批量导出上限",
+		"Export All Limit Description": "设置“批量导出”对话框中加载的最大对话数量。",
+		"Select a source to load conversations": "请在上方选择一个项目以加载对话。",
+		Search: "搜索",
+		"No results": "无结果",
+		"Batch progress": "第 {{current}}/{{total}} 批",
+		"All conversations": "全部对话",
+		"Load more conversations": "再加载 {{n}} 条",
+		"Load more conversations remaining": "再加载 {{n}} 条 · 剩余 {{remaining}} 条",
+		"Export Skipped Message": "有 {{n}} 个对话多次重试后仍失败，未包含在导出文件中：",
+		"List Rate Limited Wait": "请求过于频繁 · 请等待 {{n}} 秒后重试",
+		"List Rate Limited": "请求过于频繁 · 请稍后重试",
+		"List Load Failed": "无法加载对话",
+		"Thought for {{seconds}} seconds": "思考了 {{seconds}} 秒",
+		Thinking: "思考中",
+		"Download answer": "下载此回答",
+		"The answer could not be found": "找不到这条回答"
+	};
+	var zh_Hant_default = {
+		title: "Super ChatGPT Exporter",
+		ExportHelper: "Export",
+		Setting: "設定",
+		Language: "語言",
+		"Copy Text": "複製文字",
+		"Copied!": "已複製!",
+		Screenshot: "截圖",
+		Markdown: "Markdown",
+		HTML: "HTML",
+		JSON: "JSON",
+		Archive: "封存",
+		Save: "保存",
+		Delete: "刪除",
+		Cancel: "取消",
+		"Select All": "全選",
+		"Select...": "批次選取…",
+		"Select Not Exported": "選取未匯出的對話",
+		"Select Updated": "選取有更新的對話",
+		"Shift Select Hint": "提示：Shift+點擊可選取範圍",
+		Export: "匯出",
+		Error: "錯誤",
+		Loading: "載入中",
+		Preview: "預覽",
+		"File Name": "檔案名稱",
+		"Export All": "批量匯出",
+		"Exporter Settings": "設定",
+		"Export Dialog Title": "匯出對話",
+		"Invalid File Format": "無效的檔案格式",
+		"Export from official export file": "從官方匯出檔案匯出",
+		"Export from API": "從 API 匯出",
+		"Available variables": "可用變數",
+		"Conversation Timestamp": "對話時間戳",
+		"Conversation Timestamp Description": "會顯示在頁面上。",
+		"Enable on HTML": "在 HTML 檔案上啟用",
+		"Enable on Markdown": "在 Markdown 檔案上啟用",
+		"Use 24-hour format": "使用24小時制 (例如 23:59)",
+		"Export Format": "匯出格式",
+		"Export Metadata": "匯出元資料",
+		"Export Metadata Description": "會添加至 Markdown 以及 HTML 匯出。",
+		"Export Thinking Process": "匯出思考過程",
+		"Export Thinking Process Description": "在匯出的 Markdown 和 HTML 檔案中包含模型的思考/推理過程。",
+		"Export Sources": "匯出來源",
+		"Export Sources Description": "在匯出的 Markdown 和 HTML 檔案中包含每個回答末尾顯示的來源列表。",
+		Images: "圖片",
+		"Images Description": "Markdown 和 JSON (ZIP) 匯出時圖片的儲存方式。省略時，Markdown 會以 [image] 代替。HTML 一律嵌入圖片。",
+		"Images Embed": "嵌入檔案 (base64)",
+		"Images Omit": "省略圖片",
+		"Images Files": "另存為獨立檔案 (.zip)",
+		Sources: "來源",
+		"OpenAI Official Format": "OpenAI 官方格式",
+		"Conversation Archive Alert": "確定要封存所有選取的對話？",
+		"Conversation Archived Message": "所有選取的對話已封存。請重新整理頁面。",
+		"Conversation Delete Alert": "確定要刪除所有選取的對話？",
+		"Conversation Deleted Message": "所有選取的對話已刪除。請重新整理頁面。",
+		"Please start a conversation first": "請先開始對話。",
+		"Temporary chat could not be captured": "無法讀取此暫存對話，它可能在匯出工具載入前就已開始。你仍可以將其匯出為 PNG 截圖。",
+		"Select Project": "選擇專案",
+		"(no project)": "（無專案）",
+		"Export All Limit": "批量匯出上限",
+		"Export All Limit Description": "設定「批量匯出」對話方塊中載入的最大對話數量。",
+		"Select a source to load conversations": "請在上方選擇一個專案以載入對話。",
+		Search: "搜尋",
+		"No results": "無結果",
+		"Batch progress": "第 {{current}}/{{total}} 批",
+		"All conversations": "全部對話",
+		"Load more conversations": "再載入 {{n}} 筆",
+		"Load more conversations remaining": "再載入 {{n}} 筆 · 剩餘 {{remaining}} 筆",
+		"Export Skipped Message": "有 {{n}} 個對話重試多次仍失敗，沒有包含在匯出檔中：",
+		"List Rate Limited Wait": "請求太頻繁 · 請等 {{n}} 秒後再試",
+		"List Rate Limited": "請求太頻繁 · 請稍後再試",
+		"List Load Failed": "無法載入對話",
+		"Thought for {{seconds}} seconds": "思考了 {{seconds}} 秒",
+		Thinking: "思考中",
+		"Download answer": "下載此回答",
+		"The answer could not be found": "找不到這則回答"
+	};
+	var GMStorage = class {
+		static supported = typeof _GM_getValue === "function" && typeof _GM_setValue === "function" && typeof _GM_deleteValue === "function";
+		static get(key) {
+			const item = _GM_getValue(key, "");
+			if (item) try {
+				return JSON.parse(item);
+			} catch {
+				return null;
+			}
+			return null;
+		}
+		static set(key, value) {
+			_GM_setValue(key, JSON.stringify(value));
+		}
+		static delete(key) {
+			_GM_deleteValue(key);
+		}
+	};
+	var LocalStorage = class {
+		static supported = typeof localStorage === "object";
+		static get(key) {
+			const item = localStorage.getItem(key);
+			if (item) try {
+				return JSON.parse(item);
+			} catch {
+				return null;
+			}
+			return null;
+		}
+		static set(key, value) {
+			const item = JSON.stringify(value);
+			localStorage.setItem(key, item);
+		}
+		static delete(key) {
+			localStorage.removeItem(key);
+		}
+	};
+	var MemoryStorage = class {
+		static map = new Map();
+		static supported = true;
+		static get(key) {
+			const item = this.map.get(key);
+			if (!item) return null;
+			return item;
+		}
+		static set(key, value) {
+			this.map.set(key, value);
+		}
+		static delete(key) {
+			this.map.delete(key);
+		}
+	};
+	var ScriptStorage = class {
+		static get(key) {
+			if (GMStorage.supported) try {
+				return GMStorage.get(key);
+			} catch {}
+			if (LocalStorage.supported) try {
+				return LocalStorage.get(key);
+			} catch {}
+			return MemoryStorage.get(key);
+		}
+		static set(key, value) {
+			if (GMStorage.supported) try {
+				return GMStorage.set(key, value);
+			} catch {}
+			if (LocalStorage.supported) try {
+				return LocalStorage.set(key, value);
+			} catch {}
+			return MemoryStorage.set(key, value);
+		}
+		static delete(key) {
+			if (GMStorage.supported) try {
+				return GMStorage.delete(key);
+			} catch {}
+			if (LocalStorage.supported) try {
+				return LocalStorage.delete(key);
+			} catch {}
+			return MemoryStorage.delete(key);
+		}
+	};
+	var EN_US = {
+		name: "English",
+		code: "en-US",
+		resource: en_default
+	};
+	var ES = {
+		name: "Español",
+		code: "es",
+		resource: es_default
+	};
+	var FR = {
+		name: "Français",
+		code: "fr",
+		resource: fr_default
+	};
+	var ID_ID = {
+		name: "Indonesia",
+		code: "id-ID",
+		resource: id_default
+	};
+	var JA_JP = {
+		name: "日本語",
+		code: "ja-JP",
+		resource: jp_default
+	};
+	var RU = {
+		name: "Русский",
+		code: "ru",
+		resource: ru_default
+	};
+	var TR_TR = {
+		name: "Türkçe",
+		code: "tr-TR",
+		resource: tr_default
+	};
+	var ZH_Hans = {
+		name: "简体中文",
+		code: "zh-Hans",
+		resource: zh_Hans_default
+	};
+	var ZH_Hant = {
+		name: "繁體中文",
+		code: "zh-Hant",
+		resource: zh_Hant_default
+	};
+	var LOCALES = [
+		EN_US,
+		ES,
+		FR,
+		ID_ID,
+		JA_JP,
+		RU,
+		TR_TR,
+		ZH_Hans,
+		ZH_Hant
+	];
+	var LanguageMapping = {
+		"en": EN_US.code,
+		"en-US": EN_US.code,
+		"es": ES.code,
+		"es-ES": ES.code,
+		"es-AR": ES.code,
+		"es-CL": ES.code,
+		"es-CO": ES.code,
+		"es-MX": ES.code,
+		"es-US": ES.code,
+		"fr": FR.code,
+		"fr-FR": FR.code,
+		"id": ID_ID.code,
+		"id-ID": ID_ID.code,
+		"ja": JA_JP.code,
+		"ja-JP": JA_JP.code,
+		"ru": RU.code,
+		"ru-RU": RU.code,
+		"tr": TR_TR.code,
+		"tr-TR": TR_TR.code,
+		"zh": ZH_Hans.code,
+		"zh-CN": ZH_Hans.code,
+		"zh-MO": ZH_Hans.code,
+		"zh-SG": ZH_Hans.code,
+		"zh-Hans": ZH_Hans.code,
+		"zh-HK": ZH_Hant.code,
+		"zh-TW": ZH_Hant.code,
+		"zh-Hant": ZH_Hant.code
+	};
+	var resources = LOCALES.reduce((acc, cur) => {
+		acc[cur.code] = cur.resource;
+		return acc;
+	}, {});
+	function standardizeLanguage(language) {
+		if (!language) return null;
+		if (language in LanguageMapping) return LanguageMapping[language];
+		const shortLang = language.split("-")[0];
+		if (shortLang in LanguageMapping) return LanguageMapping[shortLang];
+		return null;
+	}
+	function getNavigatorLanguage() {
+		const { language, languages } = navigator;
+		if (language) return language;
+		if (languages && languages.length) return languages[0];
+		return null;
+	}
+	function getOaiLanguage() {
+		return (window?.localStorage?.getItem("oai/apps/locale"))?.replace(/^"(.*)"$/, "$1") ?? null;
+	}
+	function getDefaultLanguage() {
+		const storedLanguage = ScriptStorage.get(KEY_LANGUAGE);
+		const oaiLanguage = getOaiLanguage();
+		const browserLanguage = getNavigatorLanguage();
+		return standardizeLanguage(storedLanguage) ?? standardizeLanguage(oaiLanguage) ?? standardizeLanguage(browserLanguage) ?? EN_US.code;
+	}
+	var language = getDefaultLanguage();
+	var listeners = new Set();
+	function t(key, options) {
+		const template = resources[language]?.[key] ?? resources[EN_US.code][key] ?? key;
+		if (!options) return template;
+		return template.replace(/\{\{\s*(\w+)\s*\}\}/g, (_, name) => String(options[name] ?? ""));
+	}
+	function changeLanguage(lng) {
+		if (lng === language) return;
+		language = lng;
+		ScriptStorage.set(KEY_LANGUAGE, lng);
+		listeners.forEach((listener) => listener());
+	}
+	function subscribe$2(listener) {
+		listeners.add(listener);
+		return () => listeners.delete(listener);
+	}
+	var i18n = {
+		t,
+		changeLanguage,
+		get language() {
+			return language;
+		}
+	};
+	var translators = new Map();
+	function getTranslator(lng) {
+		let translator = translators.get(lng);
+		if (!translator) {
+			translator = (key, options) => t(key, options);
+			translators.set(lng, translator);
+		}
+		return translator;
+	}
+	function useTranslation() {
+		return {
+			t: getTranslator(En(subscribe$2, () => language)),
+			i18n
+		};
+	}
+	var template_default = "<!DOCTYPE html>\n<html lang=\"{{lang}}\" data-theme=\"{{theme}}\">\n<head>\n    <meta charset=\"UTF-8\" />\n    <link rel=\"icon\" href=\"https://chat.openai.com/favicon.ico\" />\n    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />\n    <title>{{title}}</title>\n    <link rel=\"stylesheet\" href=\"https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github-dark.min.css\">\n    <script src=\"https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js\"><\/script>\n    <script>\n        hljs.highlightAll()\n    <\/script>\n    <link rel=\"stylesheet\" href=\"https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.3/katex.min.css\">\n    <script src=\"https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.3/katex.min.js\"><\/script>\n    <script src=\"https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.3/contrib/auto-render.min.js\"><\/script>\n    <script>\n        document.addEventListener(\"DOMContentLoaded\", function() {\n            renderMathInElement(document.body, {\n                delimiters: [\n                    { left: \"\\\\[\", right: \"\\\\]\", display: true },\n                    { left: \"\\\\(\", right: \"\\\\)\", display: false }\n                ],\n                throwOnError: false,\n                ignoredClasses: [\"no-katex\"]\n            });\n        });\n    <\/script>\n\n    <script src=\"https://cdnjs.cloudflare.com/ajax/libs/mermaid/10.9.1/mermaid.min.js\"><\/script>\n    <script>\n        // A mermaid block stays as its source when the library cannot load or the diagram does not parse\n        document.addEventListener(\"DOMContentLoaded\", function() {\n            if (typeof mermaid === \"undefined\") return;\n            var blocks = document.querySelectorAll(\"pre.mermaid-source\");\n            if (!blocks.length) return;\n            var dark = document.documentElement.getAttribute(\"data-theme\") === \"dark\";\n            mermaid.initialize({ startOnLoad: false, securityLevel: \"strict\", theme: dark ? \"dark\" : \"default\" });\n            blocks.forEach(function(pre, index) {\n                var id = \"mermaid-\" + index;\n                mermaid.render(id, pre.textContent).then(function(result) {\n                    var diagram = document.createElement(\"div\");\n                    diagram.className = \"mermaid\";\n                    diagram.innerHTML = result.svg;\n                    pre.replaceWith(diagram);\n                }).catch(function() {\n                    var leftover = document.getElementById(\"d\" + id);\n                    if (leftover) leftover.remove();\n                });\n            });\n        });\n    <\/script>\n\n    <style>\n        :root {\n            --page-text: #0d0d0d;\n            --page-bg: #fff;\n            --td-borders: #374151;\n            --th-borders: #4b5563;\n            --tw-prose-code: var(--page-text);\n            --tw-prose-counters: #9b9b9b;\n            --tw-prose-headings: var(--page-text);\n            --tw-prose-hr: rgba(0,0,0,.25);\n            --tw-prose-links: var(--page-text);\n            --tw-prose-quotes: var(--page-text);\n            --meta-title: #616c77;\n        }\n\n        [data-theme=\"dark\"] {\n            --page-text: #ececec;\n            --page-bg: #212121;\n            --tw-prose-code: var(--page-text);\n            --tw-prose-counters: #9b9b9b;\n            --tw-prose-headings: var(--page-text);\n            --tw-prose-hr: hsla(0,0%,100%,.25);\n            --tw-prose-links: var(--page-text);\n            --tw-prose-quotes: var(--page-text);\n            --meta-title: #959faa;\n        }\n\n        * {\n            box-sizing: border-box;\n        }\n\n        ::-webkit-scrollbar {\n            height: 1rem;\n            width: .5rem\n        }\n\n        ::-webkit-scrollbar:horizontal {\n            height: .5rem;\n            width: 1rem\n        }\n\n        ::-webkit-scrollbar-track {\n            background-color: transparent;\n            border-radius: 9999px\n        }\n\n        ::-webkit-scrollbar-thumb {\n            --tw-border-opacity: 1;\n            background-color: rgba(217,217,227,.8);\n            border-color: rgba(255,255,255,var(--tw-border-opacity));\n            border-radius: 9999px;\n            border-width: 1px\n        }\n\n        ::-webkit-scrollbar-thumb:hover {\n            --tw-bg-opacity: 1;\n            background-color: rgba(236,236,241,var(--tw-bg-opacity))\n        }\n\n        [data-theme=\"dark\"] ::-webkit-scrollbar-thumb {\n            --tw-bg-opacity: 1;\n            background-color: rgba(86,88,105,var(--tw-bg-opacity))\n        }\n\n        [data-theme=\"dark\"] ::-webkit-scrollbar-thumb:hover {\n            --tw-bg-opacity: 1;\n            background-color: rgba(172,172,190,var(--tw-bg-opacity))\n        }\n\n        @media (min-width: 768px) {\n            .scrollbar-trigger ::-webkit-scrollbar-thumb {\n                visibility:hidden\n            }\n\n            .scrollbar-trigger:hover ::-webkit-scrollbar-thumb {\n                visibility: visible\n            }\n        }\n\n        body {\n            font-family: Söhne,ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,sans-serif,Helvetica Neue,Arial,Apple Color Emoji,Segoe UI Emoji,Segoe UI Symbol,Noto Color Emoji;\n            font-size: 14px;\n            line-height: 1.5;\n            color: var(--page-text);\n            background-color: var(--page-bg);\n            margin: 0;\n            padding: 0;\n        }\n\n        [data-theme=\"light\"] .sun {\n            display: none;\n        }\n\n        [data-theme=\"dark\"] .moon {\n            display: none;\n        }\n\n        .toggle {\n            display: inline-flex;\n            justify-content: center;\n            align-items: center;\n            width: 32px;\n            height: 32px;\n            border-radius: 4px;\n            background-color: #fff;\n            border: 1px solid #e2e8f0;\n        }\n\n        [data-width=\"narrow\"] .width-toggle .expand {\n            display: block;\n        }\n\n        [data-width=\"wide\"] .width-toggle .narrow {\n            display: block;\n        }\n\n        .width-toggle {\n            display: inline-flex;\n            justify-content: center;\n            align-items: center;\n            width: 32px;\n            height: 32px;\n            border-radius: 4px;\n            background-color: #fff;\n            border: 1px solid #e2e8f0;\n            margin-left: 8px;\n            cursor: pointer;\n        }\n\n        .width-toggle svg {\n            display: none;\n        }\n\n        .metadata_container {\n            display: flex;\n            flex-direction: column;\n            margin-top: 8px;\n            padding-left: 1rem;\n        }\n\n        .metadata_item {\n            display: flex;\n            flex-direction: row;\n            align-items: center;\n            border-radius: 16px;\n            padding: 4px 0.5rem;\n        }\n\n        .metadata_item:hover {\n            background-color: rgba(0,0,0,.1);\n        }\n\n        .metadata_item > div:first-child {\n            flex: 0 1 100px;\n            color: var(--meta-title);\n        }\n\n        .metadata_item > div:last-child {\n            flex: 1;\n        }\n\n        a {\n            color: var(--tw-prose-links);\n            text-decoration-line: underline;\n            text-underline-offset: 2px;\n        }\n\n        .conversation-content > p:first-child,\n        ol:first-child {\n            margin-top: 0;\n        }\n\n        :not(pre)>code {\n            color: var(--tw-prose-code);\n            font-family: ui-monospace, SFMono-Regular, \"SF Mono\", Menlo, Consolas, monospace;\n            font-size: .92em;\n            background-color: rgba(0, 0, 0, .09);\n            border-radius: 6px;\n            padding: 1px 6px;\n        }\n\n        [data-theme=\"dark\"] :not(pre)>code {\n            background-color: rgba(255, 255, 255, .1);\n        }\n\n        hr {\n            width: 100%;\n            height: 0;\n            border: 1px solid var(--tw-prose-hr);\n            margin-bottom: 1em;\n            margin-top: 1em;\n        }\n\n        pre {\n            color: #ffffff;\n            background-color: #000000;\n            overflow-x: auto;\n            margin: 0 0 1rem 0;\n            padding: 1rem;\n            border-radius: 0.375rem;\n        }\n\n        /* The highlight.js theme pads and colors `code.hljs`, but only for languages it knows */\n        pre>code.hljs {\n            padding: 0;\n            background: none;\n        }\n\n        pre>code {\n            font-family: Söhne Mono, Monaco, Andale Mono, Ubuntu Mono, monospace !important;\n            font-weight: 400;\n            font-size: .875em;\n            line-height: 1.7142857;\n        }\n\n        h1, h2, h3, h4, h5, h6 {\n            color: var(--tw-prose-headings);\n            margin: 0;\n        }\n\n        h1 {\n            font-size: 2.25em;\n            font-weight: 600;\n            line-height: 1.1111111;\n            margin-bottom: 0.8888889em;\n            margin-top: 0;\n        }\n\n        h2 {\n            font-size: 1.5em;\n            font-weight: 700;\n            line-height: 1.3333333;\n            margin-bottom: 1em;\n            margin-top: 2em;\n        }\n\n        h3 {\n            font-size: 1.25em;\n            font-weight: 600;\n            line-height: 1.6;\n            margin-bottom: .6em;\n            margin-top: 1.6em;\n        }\n\n        h4 {\n            font-weight: 600;\n            line-height: 1.5;\n            margin-bottom: .5em;\n            margin-top: 1.5em\n        }\n\n        h3,h4 {\n            margin-bottom: .5rem;\n            margin-top: 1rem;\n        }\n\n        h5 {\n            font-weight: 600;\n        }\n\n        blockquote {\n            border-left: 2px solid rgba(142,142,160,1);\n            color: var(--tw-prose-quotes);\n            font-style: normal;\n            font-weight: 400;\n            line-height: 1.6;\n            margin: 1.6em 0;\n            padding-left: 1em;\n        }\n\n        ol, ul {\n            padding-left: 1.1rem;\n        }\n\n        ::marker {\n            color: var(--tw-prose-counters);\n            font-weight: 400;\n        }\n\n        /* A wide table scrolls inside its own box, the message clips what overflows */\n        .table-wrap {\n            overflow-x: auto;\n            margin: 0 0 1rem 0;\n        }\n\n        table {\n            width: 100%;\n            border-collapse: separate;\n            border-spacing: 0 0;\n            table-layout: auto;\n            text-align: left;\n            font-size: .875em;\n            line-height: 1.7142857;\n        }\n\n        table * {\n            box-sizing: border-box;\n            border-width: 0;\n            border-style: solid;\n            border-color: #d9d9e3;\n        }\n\n        table thead {\n            border-bottom-color: var(--th-borders);\n            border-bottom-width: 1px;\n        }\n\n        table th {\n            background-color: rgba(236,236,241,.2);\n            border-bottom-width: 1px;\n            border-left-width: 1px;\n            border-top-width: 1px;\n            min-width: 4rem;\n            padding: 0.25rem 0.75rem;\n        }\n\n        table th:first-child {\n            border-top-left-radius: 0.375rem;\n        }\n\n        table th:last-child {\n            border-right-width: 1px;\n            border-top-right-radius: 0.375rem;\n        }\n\n        table tbody tr {\n            border-bottom-color: var(--td-borders);\n            border-bottom-width: 1px;\n        }\n\n        table tbody tr:last-child {\n            border-bottom-width: 0;\n        }\n\n        table tbody tr:last-child td:first-child {\n            border-bottom-left-radius: 0.375rem;\n        }\n\n        table tbody tr:last-child td:last-child {\n            border-bottom-right-radius: 0.375rem;\n        }\n\n        table td {\n            border-bottom-width: 1px;\n            border-left-width: 1px;\n            min-width: 4rem;\n            padding: 0.25rem 0.75rem;\n        }\n\n        table td:last-child {\n            border-right-width: 1px;\n        }\n\n        [type=checkbox], [type=radio] {\n            accent-color: #2563eb;\n        }\n\n        .conversation {\n            margin: 0 auto;\n            padding: 1rem;\n            max-width: 64rem;\n        }\n\n        [data-width=\"narrow\"] .conversation {\n            max-width: 64rem;\n        }\n\n        [data-width=\"wide\"] .conversation {\n            max-width: 90%;\n        }\n\n        @media (min-width: 1280px) {\n            .conversation {\n                max-width: 48rem;\n            }\n        }\n\n        @media (min-width: 1024px) {\n            .conversation {\n                max-width: 40rem;\n            }\n        }\n\n        @media (min-width: 768px) {\n            .conversation {\n                max-width: 48rem;\n            }\n        }\n\n        .conversation-header {\n            margin-bottom: 1rem;\n        }\n\n        .conversation-header h1 {\n            margin: 0;\n        }\n\n        .conversation-header h1 a {\n            font-size: 1.5rem;\n        }\n\n        .conversation-header .conversation-export {\n            margin-top: 0.5rem;\n            font-size: 0.8rem;\n        }\n\n        .conversation-header p {\n            margin-top: 0.5rem;\n            font-size: 0.8rem;\n        }\n\n        .conversation-item {\n            display: flex;\n            position: relative;\n            padding: 1rem;\n            border-left: 1px solid rgba(0,0,0,.1);\n            border-right: 1px solid rgba(0,0,0,.1);\n            border-bottom: 1px solid rgba(0,0,0,.1);\n        }\n\n        .conversation-header + .conversation-item {\n            border-top: 1px solid rgba(0,0,0,.1);\n        }\n\n        .author {\n            display: flex;\n            flex: 0 0 30px;\n            justify-content: center;\n            align-items: center;\n            width: 30px;\n            height: 30px;\n            border-radius: 0.125rem;\n            margin-right: 1rem;\n            overflow: hidden;\n        }\n\n        .author svg {\n            color: #fff;\n            width: 22px;\n            height: 22px;\n        }\n\n        .author img {\n            content: url({{avatar}});\n            width: 100%;\n            height: 100%;\n        }\n\n        .author.assistant {\n            background-color: rgb(16, 163, 127);\n        }\n\n        .conversation-content-wrapper {\n            display: flex;\n            position: relative;\n            overflow: hidden;\n            flex: 1 1 auto;\n            flex-direction: column;\n        }\n\n        .thinking {\n            font-size: 0.875rem;\n            line-height: 1.5;\n            margin-bottom: 0.75rem;\n            border: 1px solid #d1d5db;\n            border-radius: 0.5rem;\n            padding: 0.5rem 0.75rem;\n        }\n\n        .thinking summary {\n            cursor: pointer;\n            font-weight: 500;\n            color: #6b7280;\n        }\n\n        .thinking p {\n            margin: 0.5rem 0;\n            color: #6b7280;\n        }\n\n        [data-theme=\"dark\"] .thinking {\n            border-color: #4b5563;\n        }\n\n        [data-theme=\"dark\"] .thinking summary,\n        [data-theme=\"dark\"] .thinking p {\n            color: #9ca3af;\n        }\n\n        .conversation-content {\n            font-size: 1rem;\n            line-height: 1.5;\n        }\n\n        .conversation-content p {\n            white-space: pre-wrap;\n            line-height: 28px;\n        }\n\n        .conversation-content img, .conversation-content video {\n            display: block;\n            max-width: 100%;\n            height: auto;\n            margin-bottom: 2em;\n            margin-top: 2em;\n        }\n\n        /* Image search results link to their page, ChatGPT shows them as thumbnails */\n        .conversation-content a > img {\n            max-width: 320px;\n            max-height: 240px;\n            width: auto;\n            margin: 0.5rem 0;\n        }\n\n        .mermaid {\n            margin: 1rem 0;\n            overflow-x: auto;\n            text-align: center;\n        }\n\n        .attachments {\n            list-style: none;\n            margin: 0.5rem 0 0;\n            padding: 0;\n            font-size: 0.875rem;\n            color: #6b7280;\n        }\n\n        [data-theme=\"dark\"] .attachments {\n            color: #9ca3af;\n        }\n\n        .time {\n            position: absolute;\n            right: 8px;\n            bottom: 0;\n            font-size: 0.8rem;\n            color: #acacbe\n        }\n\n    </style>\n</head>\n\n<body>\n    <svg aria-hidden=\"true\" style=\"position: absolute; width: 0; height: 0; overflow: hidden;\" version=\"1.1\" xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\">\n        <symbol id=\"chatgpt\" viewBox=\"0 0 41 41\">\n            <path d=\"M37.5324 16.8707C37.9808 15.5241 38.1363 14.0974 37.9886 12.6859C37.8409 11.2744 37.3934 9.91076 36.676 8.68622C35.6126 6.83404 33.9882 5.3676 32.0373 4.4985C30.0864 3.62941 27.9098 3.40259 25.8215 3.85078C24.8796 2.7893 23.7219 1.94125 22.4257 1.36341C21.1295 0.785575 19.7249 0.491269 18.3058 0.500197C16.1708 0.495044 14.0893 1.16803 12.3614 2.42214C10.6335 3.67624 9.34853 5.44666 8.6917 7.47815C7.30085 7.76286 5.98686 8.3414 4.8377 9.17505C3.68854 10.0087 2.73073 11.0782 2.02839 12.312C0.956464 14.1591 0.498905 16.2988 0.721698 18.4228C0.944492 20.5467 1.83612 22.5449 3.268 24.1293C2.81966 25.4759 2.66413 26.9026 2.81182 28.3141C2.95951 29.7256 3.40701 31.0892 4.12437 32.3138C5.18791 34.1659 6.8123 35.6322 8.76321 36.5013C10.7141 37.3704 12.8907 37.5973 14.9789 37.1492C15.9208 38.2107 17.0786 39.0587 18.3747 39.6366C19.6709 40.2144 21.0755 40.5087 22.4946 40.4998C24.6307 40.5054 26.7133 39.8321 28.4418 38.5772C30.1704 37.3223 31.4556 35.5506 32.1119 33.5179C33.5027 33.2332 34.8167 32.6547 35.9659 31.821C37.115 30.9874 38.0728 29.9178 38.7752 28.684C39.8458 26.8371 40.3023 24.6979 40.0789 22.5748C39.8556 20.4517 38.9639 18.4544 37.5324 16.8707ZM22.4978 37.8849C20.7443 37.8874 19.0459 37.2733 17.6994 36.1501C17.7601 36.117 17.8666 36.0586 17.936 36.0161L25.9004 31.4156C26.1003 31.3019 26.2663 31.137 26.3813 30.9378C26.4964 30.7386 26.5563 30.5124 26.5549 30.2825V19.0542L29.9213 20.998C29.9389 21.0068 29.9541 21.0198 29.9656 21.0359C29.977 21.052 29.9842 21.0707 29.9867 21.0902V30.3889C29.9842 32.375 29.1946 34.2791 27.7909 35.6841C26.3872 37.0892 24.4838 37.8806 22.4978 37.8849ZM6.39227 31.0064C5.51397 29.4888 5.19742 27.7107 5.49804 25.9832C5.55718 26.0187 5.66048 26.0818 5.73461 26.1244L13.699 30.7248C13.8975 30.8408 14.1233 30.902 14.3532 30.902C14.583 30.902 14.8088 30.8408 15.0073 30.7248L24.731 25.1103V28.9979C24.7321 29.0177 24.7283 29.0376 24.7199 29.0556C24.7115 29.0736 24.6988 29.0893 24.6829 29.1012L16.6317 33.7497C14.9096 34.7416 12.8643 35.0097 10.9447 34.4954C9.02506 33.9811 7.38785 32.7263 6.39227 31.0064ZM4.29707 13.6194C5.17156 12.0998 6.55279 10.9364 8.19885 10.3327C8.19885 10.4013 8.19491 10.5228 8.19491 10.6071V19.808C8.19351 20.0378 8.25334 20.2638 8.36823 20.4629C8.48312 20.6619 8.64893 20.8267 8.84863 20.9404L18.5723 26.5542L15.206 28.4979C15.1894 28.5089 15.1703 28.5155 15.1505 28.5173C15.1307 28.5191 15.1107 28.516 15.0924 28.5082L7.04046 23.8557C5.32135 22.8601 4.06716 21.2235 3.55289 19.3046C3.03862 17.3858 3.30624 15.3413 4.29707 13.6194ZM31.955 20.0556L22.2312 14.4411L25.5976 12.4981C25.6142 12.4872 25.6333 12.4805 25.6531 12.4787C25.6729 12.4769 25.6928 12.4801 25.7111 12.4879L33.7631 17.1364C34.9967 17.849 36.0017 18.8982 36.6606 20.1613C37.3194 21.4244 37.6047 22.849 37.4832 24.2684C37.3617 25.6878 36.8382 27.0432 35.9743 28.1759C35.1103 29.3086 33.9415 30.1717 32.6047 30.6641C32.6047 30.5947 32.6047 30.4733 32.6047 30.3889V21.188C32.6066 20.9586 32.5474 20.7328 32.4332 20.5338C32.319 20.3348 32.154 20.1698 31.955 20.0556ZM35.3055 15.0128C35.2464 14.9765 35.1431 14.9142 35.069 14.8717L27.1045 10.2712C26.906 10.1554 26.6803 10.0943 26.4504 10.0943C26.2206 10.0943 25.9948 10.1554 25.7963 10.2712L16.0726 15.8858V11.9982C16.0715 11.9783 16.0753 11.9585 16.0837 11.9405C16.0921 11.9225 16.1048 11.9068 16.1207 11.8949L24.1719 7.25025C25.4053 6.53903 26.8158 6.19376 28.2383 6.25482C29.6608 6.31589 31.0364 6.78077 32.2044 7.59508C33.3723 8.40939 34.2842 9.53945 34.8334 10.8531C35.3826 12.1667 35.5464 13.6095 35.3055 15.0128ZM14.2424 21.9419L10.8752 19.9981C10.8576 19.9893 10.8423 19.9763 10.8309 19.9602C10.8195 19.9441 10.8122 19.9254 10.8098 19.9058V10.6071C10.8107 9.18295 11.2173 7.78848 11.9819 6.58696C12.7466 5.38544 13.8377 4.42659 15.1275 3.82264C16.4173 3.21869 17.8524 2.99464 19.2649 3.1767C20.6775 3.35876 22.0089 3.93941 23.1034 4.85067C23.0427 4.88379 22.937 4.94215 22.8668 4.98473L14.9024 9.58517C14.7025 9.69878 14.5366 9.86356 14.4215 10.0626C14.3065 10.2616 14.2466 10.4877 14.2479 10.7175L14.2424 21.9419ZM16.071 17.9991L20.4018 15.4978L24.7325 17.9975V22.9985L20.4018 25.4983L16.071 22.9985V17.9991Z\" fill=\"currentColor\"></path>\n        </symbol>\n    </svg>\n    <div class=\"conversation\">\n        <div class=\"conversation-header\">\n            <h1>\n                <a href=\"{{source}}\" target=\"_blank\" rel=\"noopener noreferrer\">{{title}}</a>\n                <button class=\"toggle\">\n                    <svg class=\"sun\" stroke=\"currentColor\" fill=\"none\" stroke-width=\"2\" viewBox=\"0 0 24 24\" stroke-linecap=\"round\" stroke-linejoin=\"round\" class=\"w-4 h-4\" height=\"1em\" width=\"1em\" xmlns=\"http://www.w3.org/2000/svg\"><circle cx=\"12\" cy=\"12\" r=\"5\"></circle><line x1=\"12\" y1=\"1\" x2=\"12\" y2=\"3\"></line><line x1=\"12\" y1=\"21\" x2=\"12\" y2=\"23\"></line><line x1=\"4.22\" y1=\"4.22\" x2=\"5.64\" y2=\"5.64\"></line><line x1=\"18.36\" y1=\"18.36\" x2=\"19.78\" y2=\"19.78\"></line><line x1=\"1\" y1=\"12\" x2=\"3\" y2=\"12\"></line><line x1=\"21\" y1=\"12\" x2=\"23\" y2=\"12\"></line><line x1=\"4.22\" y1=\"19.78\" x2=\"5.64\" y2=\"18.36\"></line><line x1=\"18.36\" y1=\"5.64\" x2=\"19.78\" y2=\"4.22\"></line></svg>\n                    <svg class=\"moon\" stroke=\"currentColor\" fill=\"none\" stroke-width=\"2\" viewBox=\"0 0 24 24\" stroke-linecap=\"round\" stroke-linejoin=\"round\" class=\"w-4 h-4\" height=\"1em\" width=\"1em\" xmlns=\"http://www.w3.org/2000/svg\"><path d=\"M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z\"></path></svg>\n                </button>\n                <button class=\"toggle width-toggle\">\n                    <svg class=\"expand\" stroke=\"currentColor\" fill=\"none\" stroke-width=\"2\" viewBox=\"0 0 24 24\" stroke-linecap=\"round\" stroke-linejoin=\"round\" class=\"w-4 h-4\" height=\"1em\" width=\"1em\" xmlns=\"http://www.w3.org/2000/svg\" style=\"display: block;\">\n                        <path d=\"M3 12h18M6 8l-4 4 4 4M18 8l4 4-4 4\"></path>\n                    </svg>\n                    <svg class=\"narrow\" stroke=\"currentColor\" fill=\"none\" stroke-width=\"2\" viewBox=\"0 0 24 24\" stroke-linecap=\"round\" stroke-linejoin=\"round\" class=\"w-4 h-4\" height=\"1em\" width=\"1em\" xmlns=\"http://www.w3.org/2000/svg\" style=\"display: none;\">\n                        <path d=\"M3 12h7M14 12h7M6 16l4-4-4-4M18 16l-4-4 4-4\"></path>\n                    </svg>\n                </button>\n            </h1>\n            <div class=\"conversation-export\">\n                <p>Exported by\n                <a href=\"https://github.com/pionxzh/chatgpt-exporter.git\">ChatGPT Exporter</a>\n                at {{time}}</p>\n            </div>\n            {{details}}\n        </div>\n\n        {{content}}\n    </div>\n\n\n    <script>\n        function toggleDarkMode(mode) {\n            const html = document.querySelector('html');\n            const isDarkMode = html.getAttribute('data-theme') === 'dark';\n            const newMode = mode || (isDarkMode ? 'light' : 'dark');\n            if (newMode !== 'dark' && newMode !== 'light') return;\n            html.setAttribute('data-theme', newMode);\n\n            const url = new URL(window.location);\n            url.searchParams.set('theme', newMode);\n            window.history.replaceState({}, '', url);\n        }\n        function toggleWidthMode(mode) {\n            const body = document.querySelector('body');\n            const widthToggleButton = document.querySelector('.width-toggle');\n            const isWide = body.getAttribute('data-width') === 'wide';\n            const newWidthMode = mode || (isWide ? 'narrow' : 'wide');\n            if (newWidthMode !== 'narrow' && newWidthMode !== 'wide') return;\n            body.setAttribute('data-width', newWidthMode);\n\n            const url = new URL(window.location);\n            url.searchParams.set('width', newWidthMode);\n            window.history.replaceState({}, '', url);\n\n            // Update the icon based on the current mode\n            const narrowIcon = widthToggleButton.querySelector('.narrow');\n            const expandIcon = widthToggleButton.querySelector('.expand');\n\n            if (newWidthMode === 'wide') {\n                expandIcon.style.display = \"none\";\n                narrowIcon.style.display = \"block\";\n            } else {\n                expandIcon.style.display = \"block\";\n                narrowIcon.style.display = \"none\";\n            }\n        }\n\n        const urlParams = new URLSearchParams(window.location.search);\n        const theme = urlParams.get('theme');\n        const width = urlParams.get('width');\n\n        if (theme) toggleDarkMode(theme);\n        if (width) toggleWidthMode(width);\n\n        document.querySelector('.toggle').addEventListener('click', () => toggleDarkMode());\n        document.querySelector('.width-toggle').addEventListener('click', () => toggleWidthMode());\n    <\/script>\n</body>\n\n</html>\n";
+	var MarkerRegex = /\uE200([a-z_]+)((?:\uE202[^\uE200\uE201]*)*)\uE201/gu;
+	var SpaceLike = /[\u00A0\u202F\u2007\u2060]/u;
+	var DashLike = /[\u2010-\u2015\u2212]/u;
+	function stripHighlightMarkers(input) {
+		return input.replaceAll(/[\uE203\uE204]/gu, "");
+	}
+	function normalizeCitationText(input) {
+		return stripHighlightMarkers(input).replaceAll(new RegExp(SpaceLike, "gu"), " ").replaceAll(new RegExp(DashLike, "gu"), "-");
+	}
+	function toLooseRegExp(text) {
+		const source = Array.from(normalizeCitationText(text), (char) => {
+			if (char === " ") return "[ \\u00A0\\u202F\\u2007\\u2060]";
+			if (char === "-") return "[-\\u2010-\\u2015\\u2212]";
+			return escapeRegExp(char);
+		}).join("");
+		return new RegExp(source, "gu");
+	}
+	function transformContentReferences(input, metadata, options = {}) {
+		const outputType = options.output ?? "markdown";
+		const inlineReferenceMode = options.inlineReferenceMode ?? "expanded";
+		const contentRefs = metadata?.content_references ?? [];
+		const includeImages = options.includeImages ?? true;
+		const includeCitations = options.includeCitations ?? true;
+		let output = stripHighlightMarkers(input);
+		const sortedRefs = [...contentRefs].filter((ref) => ref.type !== "sources_footnote").sort((a, b) => (b.matched_text?.length || 0) - (a.matched_text?.length || 0));
+		const fileReplacements = new Set();
+		for (const ref of sortedRefs) {
+			if (!ref.matched_text) continue;
+			if (ref.type === "client_defined_widget" && ref.data?.widget_type === "code_block") continue;
+			if (!normalizeCitationText(ref.matched_text)) continue;
+			const replacement = formatInlineReference(ref, outputType, inlineReferenceMode, includeImages, includeCitations);
+			output = output.replace(toLooseRegExp(ref.matched_text), () => replacement);
+			if (ref.type === "file" && replacement) fileReplacements.add(replacement);
+		}
+		for (const replacement of fileReplacements) {
+			const escaped = escapeRegExp(replacement);
+			output = output.replaceAll(new RegExp(`${escaped}(?:\\s*${escaped})+`, "g"), () => replacement);
+		}
+		output = output.replace(MarkerRegex, (_marker, kind, fields) => formatMarker(kind, fields.split("").slice(1), outputType));
+		if (options.includeSourceList !== false) {
+			const footnote = getSourcesFootnoteSources(contentRefs);
+			const sources = footnote.length > 0 ? footnote : dedupeSources(metadata?.cited_sources ?? []);
+			if (sources.length > 0) output = appendSourcesSection(output, sources, outputType, options.sourceListLabel ?? "Sources");
+		}
+		return output;
+	}
+	function replaceMarkers(input, output) {
+		return stripHighlightMarkers(input).replace(MarkerRegex, (_marker, kind, fields) => formatMarker(kind, fields.split("").slice(1), output));
+	}
+	function formatMarker(kind, fields, output) {
+		if (kind === "url") {
+			const [title = "", url = ""] = fields;
+			if (!url) return output === "markdown" ? escapeMarkdownText(title) : title;
+			if (output === "text") return title && title !== url ? `${title} (${url})` : url;
+			return `[${escapeMarkdownText(title || url)}](<${escapeMarkdownUrl(url)}>)`;
+		}
+		if (kind === "entity") try {
+			const name = JSON.parse(fields[0])[1];
+			if (typeof name === "string") return output === "markdown" ? escapeMarkdownText(name) : name;
+		} catch {}
+		return "";
+	}
+	function formatCitationSource(source, output, label = getSourceLabel(source)) {
+		const url = source.url?.trim();
+		if (!url) return output === "markdown" ? escapeMarkdownText(label) : label;
+		if (output === "text") return `${label}: ${url}`;
+		return `[${escapeMarkdownText(label)}](<${escapeMarkdownUrl(url)}>)`;
+	}
+	var CITATION_TYPES = new Set([
+		"grouped_webpages",
+		"webpage",
+		"nav_list"
+	]);
+	function formatInlineReference(ref, output, mode, includeImages, includeCitations) {
+		if (ref.type === "client_defined_widget" && ref.data?.widget_type === "charts_widget_v2") return formatChart(ref.data.content);
+		if (!includeImages && (ref.type === "image_group" || ref.type === "image_v2")) return "";
+		if (!includeCitations && (CITATION_TYPES.has(ref.type) || getInlineSources(ref).length > 0)) return "";
+		if (mode === "alt") return formatAlt(ref.alt);
+		if (output === "markdown" && (ref.type === "image_group" || ref.type === "image_v2")) {
+			const images = formatImageResults(ref);
+			if (images) return images;
+			return formatAlt(ref.alt);
+		}
+		const sources = getInlineSources(ref);
+		if (sources.length > 0) {
+			const separator = output === "markdown" ? ", " : "; ";
+			return `(${formatCitationSources(sources, output).join(separator)})`;
+		}
+		return formatAlt(ref.alt);
+	}
+	function formatImageResults(ref) {
+		return (ref.images ?? []).map((entry) => {
+			const image = entry.image_result ?? entry;
+			const src = image.content_url?.trim();
+			if (!src) return "";
+			const markdown = `![${escapeMarkdownText(image.title?.trim() || "Image")}](<${escapeMarkdownUrl(src)}>)`;
+			const page = image.url?.trim();
+			return page ? `[${markdown}](<${escapeMarkdownUrl(page)}>)` : markdown;
+		}).filter(Boolean).join("\n\n");
+	}
+	function formatChart(chart) {
+		const { meta, xKey, series = [], data = [], formattedData } = chart ?? {};
+		if (!xKey || series.length === 0 || data.length === 0) return "";
+		const cell = (value) => String(value ?? "").replaceAll("|", "\\|").replaceAll("\n", " ");
+		const row = (cells) => `| ${cells.map(cell).join(" | ")} |`;
+		const rows = data.map((point, index) => row([point[xKey], ...series.map(({ dataKey, valueSuffix = "" }) => formattedData?.[index]?.[dataKey] ?? (point[dataKey] == null ? "" : `${point[dataKey]}${valueSuffix}`))]));
+		const table = [
+			row([xKey, ...series.map(({ dataKey, label }) => label || dataKey)]),
+			row([xKey, ...series].map(() => "---")),
+			...rows
+		].join("\n");
+		const description = meta?.description?.trim();
+		return description ? `${description}\n\n${table}` : table;
+	}
+	function formatAlt(alt) {
+		return alt?.replaceAll(/\[([^\]]*)\]\(\)/g, "$1") ?? "";
+	}
+	function formatCitationSources(sources, output) {
+		const counts = new Map();
+		for (const source of sources) {
+			const label = getSourceLabel(source);
+			counts.set(label, (counts.get(label) ?? 0) + 1);
+		}
+		return sources.map((source) => {
+			const label = getSourceLabel(source);
+			return formatCitationSource(source, output, counts.get(label) === 1 ? label : source.title?.trim() || label);
+		});
+	}
+	function getInlineSources(ref) {
+		const sources = [];
+		for (const item of ref.items ?? []) {
+			sources.push(item);
+			sources.push(...item.supporting_websites ?? []);
+		}
+		sources.push(...ref.fallback_items ?? []);
+		if (sources.length === 0 && ref.type === "file" && ref.name) sources.push({ title: ref.name });
+		if (sources.length === 0 && (ref.url || ref.title || ref.attribution)) sources.push(ref);
+		const safeUrls = ref.safe_urls?.filter(Boolean) ?? [];
+		if (sources.length === 0 && safeUrls.length) sources.push(...safeUrls.map((url) => ({
+			title: url,
+			url
+		})));
+		return dedupeSources(sources);
+	}
+	function getSourcesFootnoteSources(contentRefs) {
+		return dedupeSources(contentRefs.filter((ref) => ref.type === "sources_footnote").flatMap((ref) => {
+			if (ref.sources?.length) return ref.sources;
+			if (ref.items?.length) return ref.items;
+			if (ref.fallback_items?.length) return ref.fallback_items;
+			if (ref.safe_urls?.length) return ref.safe_urls.map((url) => ({
+				title: url,
+				url
+			}));
+			return [];
+		}));
+	}
+	function appendSourcesSection(input, sources, output, label) {
+		const trimmed = input.trimEnd();
+		const sourceList = output === "markdown" ? [
+			`**${escapeMarkdownText(label)}:**`,
+			"",
+			...formatCitationSources(sources, output).map((entry) => `- ${entry}`)
+		].join("\n") : [`${label}:`, ...formatCitationSources(sources, output).map((entry, index) => `${index + 1}. ${entry}`)].join("\n");
+		return trimmed ? `${trimmed}\n\n${sourceList}` : sourceList;
+	}
+	function dedupeSources(sources) {
+		const seen = new Set();
+		const result = [];
+		for (const source of sources) {
+			const key = source.url?.trim() || getSourceLabel(source);
+			if (!key || seen.has(key)) continue;
+			seen.add(key);
+			result.push(source);
+		}
+		return result;
+	}
+	function getSourceLabel(source) {
+		return source.attribution?.trim() || source.title?.trim() || source.url?.trim() || "Source";
+	}
+	function escapeMarkdownText(input) {
+		return input.replaceAll("\\", "\\\\").replaceAll("[", "&#91;").replaceAll("]", "&#93;").replaceAll("|", "\\|").replaceAll("\n", " ");
+	}
+	function escapeMarkdownUrl(input) {
+		return input.replaceAll("<", "%3C").replaceAll(">", "%3E").replaceAll("|", "%7C").replaceAll("\n", "");
+	}
+	function escapeRegExp(input) {
+		return input.replaceAll(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	}
+	var require_truncate = __commonJSMin(((exports, module) => {
+		function isHighSurrogate(codePoint) {
+			return codePoint >= 55296 && codePoint <= 56319;
+		}
+		function isLowSurrogate(codePoint) {
+			return codePoint >= 56320 && codePoint <= 57343;
+		}
+		module.exports = function truncate(getLength, string, byteLength) {
+			if (typeof string !== "string") throw new Error("Input must be string");
+			var charLength = string.length;
+			var curByteLength = 0;
+			var codePoint;
+			var segment;
+			for (var i = 0; i < charLength; i += 1) {
+				codePoint = string.charCodeAt(i);
+				segment = string[i];
+				if (isHighSurrogate(codePoint) && isLowSurrogate(string.charCodeAt(i + 1))) {
+					i += 1;
+					segment += string[i];
+				}
+				curByteLength += getLength(segment);
+				if (curByteLength === byteLength) return string.slice(0, i + 1);
+				else if (curByteLength > byteLength) return string.slice(0, i - segment.length + 1);
+			}
+			return string;
+		};
+	}));
+	var require_browser$1 = __commonJSMin(((exports, module) => {
+		function isHighSurrogate(codePoint) {
+			return codePoint >= 55296 && codePoint <= 56319;
+		}
+		function isLowSurrogate(codePoint) {
+			return codePoint >= 56320 && codePoint <= 57343;
+		}
+		module.exports = function getByteLength(string) {
+			if (typeof string !== "string") throw new Error("Input must be string");
+			var charLength = string.length;
+			var byteLength = 0;
+			var codePoint = null;
+			var prevCodePoint = null;
+			for (var i = 0; i < charLength; i++) {
+				codePoint = string.charCodeAt(i);
+				if (isLowSurrogate(codePoint)) {
+					if (prevCodePoint != null && isHighSurrogate(prevCodePoint)) byteLength += 1;
+					else byteLength += 3;
+				} else if (codePoint <= 127) byteLength += 1;
+				else if (codePoint >= 128 && codePoint <= 2047) byteLength += 2;
+				else if (codePoint >= 2048 && codePoint <= 65535) byteLength += 3;
+				prevCodePoint = codePoint;
+			}
+			return byteLength;
+		};
+	}));
+	var require_browser = __commonJSMin(((exports, module) => {
+		var truncate = require_truncate();
+		var getLength = require_browser$1();
+		module.exports = truncate.bind(null, getLength);
+	}));
+	var import_sanitize_filename = __toESM(__commonJSMin(((exports, module) => {
+		var truncate = require_browser();
+		var illegalRe = /[\/\?<>\\:\*\|"]/g;
+		var controlRe = /[\x00-\x1f\x80-\x9f]/g;
+		var reservedRe = /^\.+$/;
+		var windowsReservedRe = /^(con|prn|aux|nul|com[0-9]|lpt[0-9])(\..*)?$/i;
+		var windowsTrailingRe = /[\. ]+$/;
+		function sanitize(input, replacement) {
+			if (typeof input !== "string") throw new Error("Input must be string");
+			return truncate(input.replace(illegalRe, replacement).replace(controlRe, replacement).replace(reservedRe, replacement).replace(windowsReservedRe, replacement).replace(windowsTrailingRe, replacement), 255);
+		}
+		module.exports = function(input, options) {
+			var replacement = options && options.replacement || "";
+			var output = sanitize(input, replacement);
+			if (replacement === "") return output;
+			return sanitize(output, "");
+		};
+	}))(), 1);
+	function noop() {}
+	function nonNullable(x) {
+		return x != null;
+	}
+	function onloadSafe(fn) {
+		if (document.readyState === "complete") fn();
+		else window.addEventListener("load", fn);
+	}
+	var _WORKER_SRC = "onmessage=function(e){setTimeout(function(){postMessage(e.data)},e.data.ms)}";
+	var _sleepWorker = null;
+	var _sleepWorkerFailed = false;
+	var _pendingResolves = new Map();
+	var _sleepIdCounter = 0;
+	function _getSleepWorker() {
+		if (_sleepWorkerFailed) return null;
+		if (_sleepWorker) return _sleepWorker;
+		try {
+			const blob = new Blob([_WORKER_SRC], { type: "application/javascript" });
+			const url = URL.createObjectURL(blob);
+			const w = new Worker(url);
+			URL.revokeObjectURL(url);
+			w.onmessage = (e) => {
+				const resolve = _pendingResolves.get(e.data.id);
+				if (resolve) {
+					_pendingResolves.delete(e.data.id);
+					resolve();
+				}
+			};
+			w.onerror = () => {
+				_sleepWorkerFailed = true;
+				_sleepWorker = null;
+				for (const resolve of _pendingResolves.values()) resolve();
+				_pendingResolves.clear();
+			};
+			_sleepWorker = w;
+			return w;
+		} catch {
+			_sleepWorkerFailed = true;
+			return null;
+		}
+	}
+	function sleep(ms) {
+		if (ms <= 0) return Promise.resolve();
+		const worker = _getSleepWorker();
+		if (!worker) return new Promise((resolve) => setTimeout(resolve, ms));
+		return new Promise((resolve) => {
+			const id = _sleepIdCounter++;
+			_pendingResolves.set(id, resolve);
+			worker.postMessage({
+				id,
+				ms
+			});
+		});
+	}
+	function dateStr(date = new Date()) {
+		return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+	}
+	function timestamp() {
+		return new Date().toISOString().replace(/:/g, "-").replace(/\..+/, "");
+	}
+	function getColorScheme() {
+		const root = document.documentElement;
+		const theme = root.getAttribute("data-theme");
+		if (theme === "light" || theme === "dark") return theme;
+		if (root.classList.contains("dark")) return "dark";
+		if (root.classList.contains("light")) return "light";
+		const scheme = getComputedStyle(root).colorScheme;
+		if (scheme === "light" || scheme === "dark") return scheme;
+		return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+	}
+	function unixTimestampToISOString(timestamp) {
+		if (!timestamp) return "";
+		return new Date(timestamp * 1e3).toISOString();
+	}
+	function jsonlStringify(list) {
+		return list.map((msg) => JSON.stringify(msg)).join("\n");
+	}
+	function downloadFile(filename, type, content) {
+		const blob = content instanceof Blob ? content : new Blob([content], { type });
+		const url = URL.createObjectURL(blob);
+		const a = document.createElement("a");
+		a.href = url;
+		a.download = filename;
+		document.body.appendChild(a);
+		a.click();
+		document.body.removeChild(a);
+		setTimeout(() => URL.revokeObjectURL(url), 1e3);
+	}
+	function normalizeProjectName(projectName) {
+		return projectName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+	}
+	function partSuffix(partInfo) {
+		if (!partInfo || partInfo.total <= 1) return "";
+		const pad = (n) => String(n).padStart(2, "0");
+		return `-part-${pad(partInfo.part)}-of-${pad(partInfo.total)}`;
+	}
+	function buildZipFileName(format, projectName, partInfo) {
+		const suffix = partSuffix(partInfo);
+		if (projectName) return `chatgpt-export-${format}-project-${normalizeProjectName(projectName)}${suffix}.zip`;
+		return `chatgpt-export-${format}${suffix}.zip`;
+	}
+	function buildJsonBatchFileName(projectName, partInfo) {
+		const suffix = partSuffix(partInfo);
+		if (projectName) return `chatgpt-export-project-${normalizeProjectName(projectName)}${suffix}.json`;
+		return `chatgpt-export${suffix}.json`;
+	}
+	function getFileNameWithFormat(format, ext, { title = document.title, chatId = "", createTime = Math.floor(Date.now() / 1e3), updateTime = Math.floor(Date.now() / 1e3) } = {}) {
+		const _title = (0, import_sanitize_filename.default)(title).replace(/\s+/g, "_");
+		const _createTime = unixTimestampToISOString(createTime);
+		const _updateTime = unixTimestampToISOString(updateTime);
+		return format.replace("{title}", _title).replace("{date}", dateStr()).replace("{timestamp}", timestamp()).replace("{chat_id}", chatId).replace("{create_time}", _createTime).replace("{update_time}", _updateTime).concat(`.${ext}`);
+	}
+	var MathRegex = new RegExp([
+		/(?<blockStart>^|\n)(?<indent>[ \t]*)\\\[(?<block>[\s\S]+?)\\\][ \t]*(?=\n|$)/.source,
+		/\\\[(?<display>[\s\S]+?)\\\]/.source,
+		/\\\((?<inline>[\s\S]+?)\\\)/.source,
+		/(?<dollarBlock>\$\$[\s\S]+?\$\$)/.source,
+		/(?<=^|\s)(?<dollarInline>\$[^\s$](?:[^$\n]*[^\s$])?\$)(?=\s|$)/.source
+	].join("|"), "g");
+	function protectMath(input) {
+		const formulas = [];
+		const placeholder = (formula) => `╬${formulas.push(formula) - 1}╬`;
+		const text = mapOutsideCode(input, (part) => part.replace(MathRegex, (...args) => {
+			const groups = args.at(-1);
+			if (groups.block != null) {
+				const { blockStart = "", indent = "" } = groups;
+				return `${blockStart}${indent}${placeholder(`$$\n${groups.block.trim()}\n${indent}$$`)}`;
+			}
+			if (groups.display != null) return placeholder(`$$${groups.display.trim()}$$`);
+			if (groups.inline != null) return placeholder(`$${groups.inline.trim()}$`);
+			return placeholder(groups.dollarBlock ?? groups.dollarInline ?? "");
+		}));
+		const restore = (output, escape = (formula) => formula) => output.replace(/╬(\d+)╬/g, (match, index) => {
+			const formula = formulas[Number(index)];
+			return formula == null ? match : escape(formula);
+		});
+		return {
+			text,
+			restore
+		};
+	}
+	function toBracketDelimiters(formula) {
+		const display = /^\$\$([\s\S]*)\$\$$/.exec(formula);
+		if (display) return `\\[${display[1]}\\]`;
+		return `\\(${formula.slice(1, -1)}\\)`;
+	}
 	function standardizeLineBreaks(text) {
 		return text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+	}
+	function decodeTypedLineBreaks(text) {
+		return mapOutsideCode(text, (part) => part.replace(/^[ \t]*\\$/gm, "").replace(/(?<!\\)\\$/gm, "  "));
 	}
 	function transformAuthor(author) {
 		switch (author.role) {
@@ -10874,7 +11427,20 @@
 			})];
 		}) ?? [];
 	}
-	async function exportToHtml(fileNameFormat, metaList) {
+	var YamlReserved = /^(?:true|false|null|yes|no|on|off|y|n|~)$/i;
+	var YamlNumber = /^[+-]?\d[\d_]*(?:\.\d+)?(?:e[+-]?\d+)?$|^0x[\da-f]+$/i;
+	function yamlScalar(value) {
+		if (value === "") return value;
+		return !/^[\s\-?:,[\]{}#&*!|>'"%@`]/.test(value) && !/[\n\r\t]/.test(value) && !value.includes(": ") && !value.includes(" #") && !/[:\s]$/.test(value) && !YamlReserved.test(value) && !YamlNumber.test(value) ? value : JSON.stringify(value);
+	}
+	function yamlKey(name) {
+		return /^[\p{L}\p{N}_][\p{L}\p{N}_ .-]*$/u.test(name) && !/\s$/.test(name) && !YamlReserved.test(name) ? name : JSON.stringify(name);
+	}
+	function formatFrontMatter(metaList) {
+		if (metaList.length === 0) return "";
+		return `---\n${metaList.map(([name, value]) => `${yamlKey(name)}: ${yamlScalar(value)}`).join("\n")}\n---\n\n`;
+	}
+	async function exportToHtml(fileNameFormat, metaList, answerIds) {
 		if (!checkIfConversationStarted()) {
 			alert(i18n.t("Please start a conversation first"));
 			return false;
@@ -10885,10 +11451,16 @@
 		}
 		const userAvatar = await getUserAvatar();
 		const chatId = await getCurrentChatId();
-		const conversation = processConversation(await withImageAssets(await fetchConversation(chatId)), { enableThinking: ScriptStorage.get("exporter:enable_thinking") ?? false });
+		const processed = processConversation(await withImageAssets(await fetchConversation(chatId)), { enableThinking: ScriptStorage.get("exporter:enable_thinking") ?? false });
+		const answer = answerIds && selectAnswer(processed, answerIds);
+		if (answer && answer.conversationNodes.length === 0) {
+			alert(i18n.t("The answer could not be found"));
+			return false;
+		}
+		const conversation = answer ?? processed;
 		const html = conversationToHtml(conversation, userAvatar, metaList);
 		downloadFile(getFileNameWithFormat(fileNameFormat, "html", {
-			title: conversation.title,
+			title: answer ? `${conversation.title}-answer-${answer.answerIndex}` : conversation.title,
 			chatId,
 			createTime: conversation.createTime,
 			updateTime: conversation.updateTime
@@ -10912,7 +11484,7 @@
 				filenameMap.set(fileName, count + 1);
 				fileName = `${fileName.slice(0, -5)} (${count}).html`;
 			} else filenameMap.set(fileName, 1);
-			const content = conversationToHtml(conversation, userAvatar, metaList);
+			const content = standardizeLineBreaks(conversationToHtml(conversation, userAvatar, metaList));
 			zip.file(fileName, content);
 		});
 		const blob = await zip.generateAsync({
@@ -10949,7 +11521,8 @@
 					const { text, restore } = protectMath(input);
 					return restore(toHtml(text), (formula) => escapeHtml(toBracketDelimiters(formula)));
 				});
-			} else postSteps = [(input) => `<p class="no-katex">${escapeHtml(input)}</p>`];
+			} else if (message.author.role === "user" && message.metadata?.serialization_metadata?.render_format === "markdown") postSteps = [(input) => `<div class="no-katex">${toHtml(decodeTypedLineBreaks(input))}</div>`];
+			else postSteps = [(input) => `<p class="no-katex">${escapeHtml(input)}</p>`];
 			const postProcess = (input) => postSteps.reduce((acc, fn) => fn(acc), input);
 			const content = transformContent$2(message.content, message.metadata, postProcess);
 			const attachments = getFileAttachmentNames(message);
@@ -10985,7 +11558,7 @@
 		const date = dateStr();
 		const time = new Date().toISOString();
 		const source = `${baseUrl}/c/${id}`;
-		const lang = document.documentElement.lang ?? "en";
+		const lang = document.documentElement.lang || "en";
 		const theme = getColorScheme();
 		const _metaList = resolveMetaList(metaList, getMetaVariables(conversation, source, date));
 		return fillTemplate(template_default, {
@@ -11011,9 +11584,9 @@
 			case "text": return postProcess(content.parts?.join("\n") || "");
 			case "code": return postProcess(`Code:\n\`\`\`\n${content.text}\n\`\`\``);
 			case "execution_output":
-				if (metadata?.aggregate_result?.messages) return metadata.aggregate_result.messages.filter((msg) => msg.message_type === "image").map((msg) => `<img src="${msg.image_url}" height="${msg.height}" width="${msg.width}" />`).join("\n");
+				if (metadata?.aggregate_result?.messages) return metadata.aggregate_result.messages.filter((msg) => msg.message_type === "image").map((msg) => `<img src="${escapeHtml(msg.image_url)}" height="${Number(msg.height) || ""}" width="${Number(msg.width) || ""}" />`).join("\n");
 				return postProcess(`Result:\n\`\`\`\n${content.text}\n\`\`\`` || "");
-			case "tether_quote": return postProcess(`> ${content.title || content.text || ""}`);
+			case "tether_quote": return postProcess((content.title || content.text || "").split("\n").map((line) => `> ${line}`).join("\n"));
 			case "tether_browsing_code": return postProcess("");
 			case "tether_browsing_display": {
 				const metadataList = metadata?._cite_metadata?.metadata_list;
@@ -11024,7 +11597,7 @@
 			}
 			case "multimodal_text": return content.parts?.map((part) => {
 				if (typeof part === "string") return postProcess(part);
-				if (part.content_type === "image_asset_pointer") return `<img src="${part.asset_pointer}" height="${part.height}" width="${part.width}" />`;
+				if (part.content_type === "image_asset_pointer") return `<img src="${escapeHtml(part.asset_pointer)}" height="${Number(part.height) || ""}" width="${Number(part.width) || ""}" />`;
 				if (part.content_type === "audio_transcription") return `<div style="font-style: italic; opacity: 0.65;">“${escapeHtml(part.text)}”</div>`;
 				if (part.content_type === "audio_asset_pointer") return null;
 				if (part.content_type === "real_time_user_audio_video_asset_pointer") return null;
@@ -11032,21 +11605,803 @@
 			}).join("\n") || "";
 			default:
 				console.warn("[Exporter] Unsupported Content:", content.content_type, content);
-				return postProcess(`[Unsupported Content: ${content.content_type} ]`);
+				return postProcess(`[Unsupported Content: ${content.content_type}]`);
 		}
 	}
 	function formatThinkingHtml(thinking) {
-		const durationLabel = thinking.durationSeconds != null ? `Thought for ${thinking.durationSeconds} seconds` : "Thinking";
+		const durationLabel = thinking.durationSeconds != null ? i18n.t("Thought for {{seconds}} seconds", { seconds: thinking.durationSeconds }) : i18n.t("Thinking");
 		const parts = [];
 		if (thinking.activities?.length) {
-			const items = thinking.activities.map((a) => `<li>${escapeHtml(a)}</li>`).join("");
+			const items = thinking.activities.map((a) => `<li>${escapeHtml(replaceMarkers(a, "text"))}</li>`).join("");
 			parts.push(`<ul>${items}</ul>`);
 		}
-		const thoughts = thinking.thoughts.map((t) => t.content || t.summary).filter(Boolean).map((text) => `<p>${escapeHtml(text)}</p>`).join("\n");
+		const thoughts = thinking.thoughts.map((t) => t.content || t.summary).filter(Boolean).map((text) => `<p>${escapeHtml(replaceMarkers(text, "text"))}</p>`).join("\n");
 		if (thoughts) parts.push(thoughts);
 		const body = parts.join("\n");
 		if (!body) return "";
 		return `<details class="thinking"><summary>${escapeHtml(durationLabel)}</summary>${body}</details>`;
+	}
+	var ASSETS_DIR = "assets";
+	var IMAGE_EXTENSIONS = {
+		"image/jpeg": "jpg",
+		"image/png": "png",
+		"image/gif": "gif",
+		"image/webp": "webp",
+		"image/svg+xml": "svg"
+	};
+	function getImageMode() {
+		return ScriptStorage.get("exporter:image_mode") ?? "embed";
+	}
+	async function extractImageFiles(conversation, assets) {
+		const copy = structuredClone(conversation);
+		await replaceImageSources(copy, async (src) => {
+			const match = /^data:([^;,]*)[^,]*;base64,(.*)$/s.exec(src);
+			if (!match) return null;
+			const [, mimeType, base64] = match;
+			const ext = IMAGE_EXTENSIONS[mimeType.toLowerCase()] ?? "bin";
+			const name = `image-${await hashBase64(base64)}.${ext}`;
+			assets.set(name, base64);
+			return `${ASSETS_DIR}/${name}`;
+		});
+		return copy;
+	}
+	function addImageFilesToZip(zip, assets) {
+		assets.forEach((base64, name) => {
+			zip.file(`${ASSETS_DIR}/${name}`, base64, {
+				base64: true,
+				compression: "STORE"
+			});
+		});
+	}
+	async function hashBase64(base64) {
+		const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
+		const digest = await crypto.subtle.digest("SHA-256", bytes);
+		return Array.from(new Uint8Array(digest).slice(0, 8), (b) => b.toString(16).padStart(2, "0")).join("");
+	}
+	function loadImages(conversation, imageMode) {
+		return imageMode === "omit" ? Promise.resolve(conversation) : withImageAssets(conversation);
+	}
+	async function exportToMarkdown(fileNameFormat, metaList, answerIds) {
+		if (!checkIfConversationStarted()) {
+			alert(i18n.t("Please start a conversation first"));
+			return false;
+		}
+		if (!checkIfTemporaryChatIsExportable()) {
+			alert(i18n.t("Temporary chat could not be captured"));
+			return false;
+		}
+		const chatId = await getCurrentChatId();
+		const imageMode = getImageMode();
+		const assets = new Map();
+		let rawConversation = await loadImages(await fetchConversation(chatId), imageMode);
+		if (imageMode === "files") rawConversation = await extractImageFiles(rawConversation, assets);
+		const enableThinking = ScriptStorage.get("exporter:enable_thinking") ?? false;
+		const processed = processConversation(rawConversation, { enableThinking });
+		const answer = answerIds && selectAnswer(processed, answerIds);
+		if (answer && answer.conversationNodes.length === 0) {
+			alert(i18n.t("The answer could not be found"));
+			return false;
+		}
+		const conversation = answer ?? processed;
+		const markdown = standardizeLineBreaks(conversationToMarkdown(conversation, metaList, imageMode, !!answer));
+		const fileName = getFileNameWithFormat(fileNameFormat, "md", {
+			title: answer ? `${conversation.title}-answer-${answer.answerIndex}` : conversation.title,
+			chatId,
+			createTime: conversation.createTime,
+			updateTime: conversation.updateTime
+		});
+		if (assets.size === 0) {
+			downloadFile(fileName, "text/markdown", markdown);
+			return true;
+		}
+		const zip = new jszip.default();
+		zip.file(fileName, markdown);
+		addImageFilesToZip(zip, assets);
+		downloadFile(fileName.replace(/\.md$/, ".zip"), "application/zip", await generateZip(zip));
+		return true;
+	}
+	async function exportAllToMarkdown(fileNameFormat, apiConversations, metaList, projectName, partIndex, totalParts) {
+		const zip = new jszip.default();
+		const filenameMap = new Map();
+		const enableThinking = ScriptStorage.get("exporter:enable_thinking") ?? false;
+		const imageMode = getImageMode();
+		const assets = new Map();
+		(imageMode === "files" ? await Promise.all(apiConversations.map((x) => extractImageFiles(x, assets))) : apiConversations).map((x) => processConversation(x, { enableThinking })).forEach((conversation) => {
+			let fileName = getFileNameWithFormat(fileNameFormat, "md", {
+				title: conversation.title,
+				chatId: conversation.id,
+				createTime: conversation.createTime,
+				updateTime: conversation.updateTime
+			});
+			if (filenameMap.has(fileName)) {
+				const count = filenameMap.get(fileName) ?? 1;
+				filenameMap.set(fileName, count + 1);
+				fileName = `${fileName.slice(0, -3)} (${count}).md`;
+			} else filenameMap.set(fileName, 1);
+			const content = standardizeLineBreaks(conversationToMarkdown(conversation, metaList, imageMode));
+			zip.file(fileName, content);
+		});
+		addImageFilesToZip(zip, assets);
+		const blob = await generateZip(zip);
+		downloadFile(buildZipFileName("markdown", projectName, partIndex != null && totalParts != null ? {
+			part: partIndex,
+			total: totalParts
+		} : void 0), "application/zip", blob);
+		return true;
+	}
+	function generateZip(zip) {
+		return zip.generateAsync({
+			type: "blob",
+			compression: "DEFLATE",
+			compressionOptions: { level: 9 }
+		});
+	}
+	var ASSISTANT_HEADING_OFFSET = 2;
+	function conversationToMarkdown(conversation, metaList, imageMode, answerOnly = false) {
+		const { id, title, conversationNodes } = conversation;
+		const frontMatter = formatFrontMatter(resolveMetaList(metaList, getMetaVariables(conversation, `${baseUrl}/c/${id}`)));
+		const enableTimestamp = ScriptStorage.get("exporter:enable_timestamp") ?? false;
+		const timeStampMarkdown = ScriptStorage.get("exporter:timestamp_markdown") ?? false;
+		const timeStamp24H = ScriptStorage.get("exporter:timestamp_24h") ?? false;
+		const enableSources = ScriptStorage.get("exporter:enable_sources") ?? true;
+		const renderImage = imageMode === "omit" ? () => "[image]" : (src) => isLocalImageSrc(src) ? `![image](${src})` : "";
+		const footnotes = { next: 1 };
+		const headingOffset = answerOnly ? 0 : ASSISTANT_HEADING_OFFSET;
+		const content = conversationNodes.map(({ message, thinking }) => {
+			if (!message || !message.content) return null;
+			if (shouldSkipMessageInExport(message)) return null;
+			const timestamp = message?.create_time ?? "";
+			const showTimestamp = enableTimestamp && timeStampMarkdown && timestamp;
+			let timestampHtml = "";
+			if (showTimestamp) {
+				const date = new Date(timestamp * 1e3);
+				const conversationTime = date.toLocaleTimeString("en-US", {
+					hour: "2-digit",
+					minute: "2-digit",
+					hour12: !timeStamp24H
+				});
+				timestampHtml = `<time datetime="${date.toISOString()}" title="${date.toLocaleString()}">${conversationTime}</time>\n\n`;
+			}
+			const author = transformAuthor(message.author);
+			const thinkingBlock = thinking ? formatThinkingMarkdown(thinking) : "";
+			const isAssistant = message.author.role === "assistant";
+			const postSteps = [];
+			if (isAssistant) {
+				postSteps.push((input) => transformContentReferences(input, message.metadata, {
+					includeSourceList: enableSources,
+					sourceListLabel: i18n.t("Sources"),
+					includeImages: false,
+					includeCitations: false
+				}));
+				postSteps.push((input) => transformFootNotes$1(input, message.metadata, footnotes));
+				postSteps.push((input) => {
+					const { text, restore } = protectMath(input);
+					return restore(toMarkdown(fromMarkdown(text), text, {
+						headingOffset,
+						dropRemoteImages: true
+					}));
+				});
+			}
+			const postProcess = (input) => postSteps.reduce((acc, fn) => fn(acc), input);
+			const isMarkdownText = message.metadata?.serialization_metadata?.render_format === "markdown";
+			const markdownText = (input) => {
+				const typedText = decodeTypedLineBreaks(input);
+				return toMarkdown(fromMarkdown(typedText), typedText, {
+					headingOffset,
+					dropRemoteImages: true
+				});
+			};
+			const prose = isAssistant ? postProcess : isMarkdownText ? markdownText : plainTextToMarkdown;
+			const block = isAssistant ? postProcess : (input) => input;
+			const content = transformContent$1(message.content, message.metadata, prose, block, renderImage);
+			const attachments = getFileAttachmentNames(message).map((name) => `- 📎 ${name}`).join("\n");
+			const attachmentsBlock = attachments ? `\n\n${attachments}` : "";
+			if (!content.trim() && !attachments && !thinkingBlock) return null;
+			return `${answerOnly ? "" : `## ${author}:\n`}${timestampHtml}${thinkingBlock}${content}${attachmentsBlock}`;
+		}).filter(Boolean).join("\n\n");
+		return answerOnly ? `${frontMatter}${content.trimEnd()}\n` : `${frontMatter}# ${title.replace(/\s+/g, " ").trim()}\n\n${content}`;
+	}
+	function transformFootNotes$1(input, metadata, footnotes) {
+		const footNoteMarkRegex = /【(\d+)†\((.+?)\)】/g;
+		const numbers = new Map();
+		const definitions = [];
+		const output = input.replace(footNoteMarkRegex, (match, citeIndex, _evidenceText) => {
+			const citation = metadata?.citations?.find((cite) => cite.metadata?.extra?.cited_message_idx === +citeIndex);
+			if (!citation) return match;
+			let number = numbers.get(+citeIndex);
+			if (number == null) {
+				number = footnotes.next++;
+				numbers.set(+citeIndex, number);
+				const citeTitle = citation.metadata?.title ?? "No title";
+				const url = citation.metadata?.url;
+				definitions.push(`[^${number}]: ${url ? `[${escapeMarkdownText(citeTitle)}](<${url}>)` : citeTitle}`);
+			}
+			return `[^${number}]`;
+		});
+		return definitions.length > 0 ? `${output}\n\n${definitions.join("\n")}` : output;
+	}
+	function quote(text) {
+		return text.split("\n").map((line) => `> ${line}`).join("\n");
+	}
+	function transformContent$1(content, metadata, prose, block, renderImage) {
+		switch (content.content_type) {
+			case "text": return prose(content.parts?.join("\n") || "");
+			case "code": return block(`Code:\n${codeFence(content.text)}`);
+			case "execution_output":
+				if (metadata?.aggregate_result?.messages) return metadata.aggregate_result.messages.filter((msg) => msg.message_type === "image").map((msg) => renderImage(msg.image_url)).filter(Boolean).join("\n\n");
+				return block(`Result:\n${codeFence(content.text ?? "")}`);
+			case "tether_quote": return block(quote(content.title || content.text || ""));
+			case "tether_browsing_code": return block("");
+			case "tether_browsing_display": {
+				const metadataList = metadata?._cite_metadata?.metadata_list;
+				if (Array.isArray(metadataList) && metadataList.length > 0) return block(metadataList.map(({ title, url }) => `> [${escapeMarkdownText(title)}](<${url}>)`).join("\n"));
+				return block("");
+			}
+			case "multimodal_text": return content.parts?.map((part) => {
+				if (typeof part === "string") return prose(part);
+				if (part.content_type === "image_asset_pointer") return renderImage(part.asset_pointer);
+				if (part.content_type === "audio_transcription") return `[audio] ${plainTextToMarkdown(part.text)}`;
+				if (part.content_type === "audio_asset_pointer") return null;
+				if (part.content_type === "real_time_user_audio_video_asset_pointer") return null;
+				return block("[Unsupported multimodal content]");
+			}).filter(Boolean).join("\n\n") || "";
+			default:
+				console.warn("[Exporter] Unsupported Content:", content.content_type, content);
+				return block(`[Unsupported Content: ${content.content_type}]`);
+		}
+	}
+	function formatThinkingMarkdown(thinking) {
+		const durationLabel = thinking.durationSeconds != null ? i18n.t("Thought for {{seconds}} seconds", { seconds: thinking.durationSeconds }) : i18n.t("Thinking");
+		const parts = [];
+		if (thinking.activities?.length) parts.push(thinking.activities.map((a) => `- ${replaceMarkers(a, "markdown")}`).join("\n"));
+		const thoughts = thinking.thoughts.map((t) => t.content || t.summary).filter(Boolean).map((text) => replaceMarkers(text, "markdown")).join("\n\n");
+		if (thoughts) parts.push(thoughts);
+		const body = parts.join("\n\n");
+		if (!body) return "";
+		return `<details>\n<summary>${durationLabel}</summary>\n\n${body}\n\n</details>\n\n`;
+	}
+	var _ = 0;
+	function o(o, e, n, t, f, l) {
+		var s, u, a = {};
+		for (u in e) "ref" == u ? s = e[u] : a[u] = e[u];
+		var i = {
+			type: o,
+			props: a,
+			key: n,
+			ref: s,
+			__k: null,
+			__: null,
+			__b: 0,
+			__e: null,
+			__d: void 0,
+			__c: null,
+			__h: null,
+			constructor: void 0,
+			__v: --_,
+			__source: f,
+			__self: l
+		};
+		if ("function" == typeof o && (s = o.defaultProps)) for (u in s) void 0 === a[u] && (a[u] = s[u]);
+		return l$1.vnode && l$1.vnode(i), i;
+	}
+	function FileCode() {
+		return o("svg", {
+			xmlns: "http://www.w3.org/2000/svg",
+			viewBox: "0 0 384 512",
+			className: "ce-icon",
+			fill: "currentColor",
+			children: o("path", { d: "M64 0C28.7 0 0 28.7 0 64V448c0 35.3 28.7 64 64 64H320c35.3 0 64-28.7 64-64V160H256c-17.7 0-32-14.3-32-32V0H64zM256 0V128H384L256 0zM153 289l-31 31 31 31c9.4 9.4 9.4 24.6 0 33.9s-24.6 9.4-33.9 0L71 337c-9.4-9.4-9.4-24.6 0-33.9l48-48c9.4-9.4 24.6-9.4 33.9 0s9.4 24.6 0 33.9zM265 255l48 48c9.4 9.4 9.4 24.6 0 33.9l-48 48c-9.4 9.4-24.6 9.4-33.9 0s-9.4-24.6 0-33.9l31-31-31-31c-9.4-9.4-9.4-24.6 0-33.9s24.6-9.4 33.9 0z" })
+		});
+	}
+	function IconCamera() {
+		return o("svg", {
+			xmlns: "http://www.w3.org/2000/svg",
+			viewBox: "0 0 512 512",
+			className: "ce-icon",
+			fill: "currentColor",
+			children: o("path", { d: "M149.1 64.8L138.7 96H64C28.7 96 0 124.7 0 160V416c0 35.3 28.7 64 64 64H448c35.3 0 64-28.7 64-64V160c0-35.3-28.7-64-64-64H373.3L362.9 64.8C356.4 45.2 338.1 32 317.4 32H194.6c-20.7 0-39 13.2-45.5 32.8zM256 384c-53 0-96-43-96-96s43-96 96-96s96 43 96 96s-43 96-96 96z" })
+		});
+	}
+	function IconMarkdown() {
+		return o("svg", {
+			xmlns: "http://www.w3.org/2000/svg",
+			viewBox: "0 0 640 512",
+			className: "ce-icon",
+			fill: "currentColor",
+			children: o("path", { d: "M593.8 59.1H46.2C20.7 59.1 0 79.8 0 105.2v301.5c0 25.5 20.7 46.2 46.2 46.2h547.7c25.5 0 46.2-20.7 46.1-46.1V105.2c0-25.4-20.7-46.1-46.2-46.1zM338.5 360.6H277v-120l-61.5 76.9-61.5-76.9v120H92.3V151.4h61.5l61.5 76.9 61.5-76.9h61.5v209.2zm135.3 3.1L381.5 256H443V151.4h61.5V256H566z" })
+		});
+	}
+	function IconCopy() {
+		return o("svg", {
+			xmlns: "http://www.w3.org/2000/svg",
+			viewBox: "0 0 512 512",
+			className: "ce-icon",
+			fill: "currentColor",
+			children: o("path", { d: "M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z" })
+		});
+	}
+	function IconArrowRightFromBracket() {
+		return o("svg", {
+			xmlns: "http://www.w3.org/2000/svg",
+			viewBox: "0 0 576 512",
+			className: "ce-icon",
+			fill: "currentColor",
+			children: o("path", { d: "M534.6 278.6c12.5-12.5 12.5-32.8 0-45.3l-128-128c-12.5-12.5-32.8-12.5-45.3 0s-12.5 32.8 0 45.3L434.7 224 224 224c-17.7 0-32 14.3-32 32s14.3 32 32 32l210.7 0-73.4 73.4c-12.5 12.5-12.5 32.8 0 45.3s32.8 12.5 45.3 0l128-128zM192 96c17.7 0 32-14.3 32-32s-14.3-32-32-32l-64 0c-53 0-96 43-96 96l0 256c0 53 43 96 96 96l64 0c17.7 0 32-14.3 32-32s-14.3-32-32-32l-64 0c-17.7 0-32-14.3-32-32l0-256c0-17.7 14.3-32 32-32l64 0z" })
+		});
+	}
+	function IconSetting() {
+		return o("svg", {
+			xmlns: "http://www.w3.org/2000/svg",
+			viewBox: "0 0 15 15",
+			className: "ce-icon",
+			stroke: "currentColor",
+			"stroke-width": "0.5",
+			children: o("path", {
+				d: "M7.07095 0.650238C6.67391 0.650238 6.32977 0.925096 6.24198 1.31231L6.0039 2.36247C5.6249 2.47269 5.26335 2.62363 4.92436 2.81013L4.01335 2.23585C3.67748 2.02413 3.23978 2.07312 2.95903 2.35386L2.35294 2.95996C2.0722 3.2407 2.0232 3.6784 2.23493 4.01427L2.80942 4.92561C2.62307 5.2645 2.47227 5.62594 2.36216 6.00481L1.31209 6.24287C0.924883 6.33065 0.650024 6.6748 0.650024 7.07183V7.92897C0.650024 8.32601 0.924883 8.67015 1.31209 8.75794L2.36228 8.99603C2.47246 9.375 2.62335 9.73652 2.80979 10.0755L2.2354 10.9867C2.02367 11.3225 2.07267 11.7602 2.35341 12.041L2.95951 12.6471C3.24025 12.9278 3.67795 12.9768 4.01382 12.7651L4.92506 12.1907C5.26384 12.377 5.62516 12.5278 6.0039 12.6379L6.24198 13.6881C6.32977 14.0753 6.67391 14.3502 7.07095 14.3502H7.92809C8.32512 14.3502 8.66927 14.0753 8.75705 13.6881L8.99505 12.6383C9.37411 12.5282 9.73573 12.3773 10.0748 12.1909L10.986 12.7653C11.3218 12.977 11.7595 12.928 12.0403 12.6473L12.6464 12.0412C12.9271 11.7604 12.9761 11.3227 12.7644 10.9869L12.1902 10.076C12.3768 9.73688 12.5278 9.37515 12.638 8.99596L13.6879 8.75794C14.0751 8.67015 14.35 8.32601 14.35 7.92897V7.07183C14.35 6.6748 14.0751 6.33065 13.6879 6.24287L12.6381 6.00488C12.528 5.62578 12.3771 5.26414 12.1906 4.92507L12.7648 4.01407C12.9766 3.6782 12.9276 3.2405 12.6468 2.95975L12.0407 2.35366C11.76 2.07292 11.3223 2.02392 10.9864 2.23565L10.0755 2.80989C9.73622 2.62328 9.37437 2.47229 8.99505 2.36209L8.75705 1.31231C8.66927 0.925096 8.32512 0.650238 7.92809 0.650238H7.07095ZM4.92053 3.81251C5.44724 3.44339 6.05665 3.18424 6.71543 3.06839L7.07095 1.50024H7.92809L8.28355 3.06816C8.94267 3.18387 9.5524 3.44302 10.0794 3.81224L11.4397 2.9547L12.0458 3.56079L11.1882 4.92117C11.5573 5.44798 11.8164 6.0575 11.9321 6.71638L13.5 7.07183V7.92897L11.932 8.28444C11.8162 8.94342 11.557 9.55301 11.1878 10.0798L12.0453 11.4402L11.4392 12.0462L10.0787 11.1886C9.55192 11.5576 8.94241 11.8166 8.28355 11.9323L7.92809 13.5002H7.07095L6.71543 11.932C6.0569 11.8162 5.44772 11.5572 4.92116 11.1883L3.56055 12.046L2.95445 11.4399L3.81213 10.0794C3.4431 9.55266 3.18403 8.94326 3.06825 8.2845L1.50002 7.92897V7.07183L3.06818 6.71632C3.18388 6.05765 3.44283 5.44833 3.81171 4.92165L2.95398 3.561L3.56008 2.95491L4.92053 3.81251ZM9.02496 7.50008C9.02496 8.34226 8.34223 9.02499 7.50005 9.02499C6.65786 9.02499 5.97513 8.34226 5.97513 7.50008C5.97513 6.65789 6.65786 5.97516 7.50005 5.97516C8.34223 5.97516 9.02496 6.65789 9.02496 7.50008ZM9.92496 7.50008C9.92496 8.83932 8.83929 9.92499 7.50005 9.92499C6.1608 9.92499 5.07513 8.83932 5.07513 7.50008C5.07513 6.16084 6.1608 5.07516 7.50005 5.07516C8.83929 5.07516 9.92496 6.16084 9.92496 7.50008Z",
+				fill: "currentColor",
+				fillRule: "evenodd",
+				clipRule: "evenodd"
+			})
+		});
+	}
+	function IconCross() {
+		return o("svg", {
+			xmlns: "http://www.w3.org/2000/svg",
+			viewBox: "0 0 15 15",
+			width: "15",
+			height: "15",
+			children: o("path", {
+				d: "M11.7816 4.03157C12.0062 3.80702 12.0062 3.44295 11.7816 3.2184C11.5571 2.99385 11.193 2.99385 10.9685 3.2184L7.50005 6.68682L4.03164 3.2184C3.80708 2.99385 3.44301 2.99385 3.21846 3.2184C2.99391 3.44295 2.99391 3.80702 3.21846 4.03157L6.68688 7.49999L3.21846 10.9684C2.99391 11.193 2.99391 11.557 3.21846 11.7816C3.44301 12.0061 3.80708 12.0061 4.03164 11.7816L7.50005 8.31316L10.9685 11.7816C11.193 12.0061 11.5571 12.0061 11.7816 11.7816C12.0062 11.557 12.0062 11.193 11.7816 10.9684L8.31322 7.49999L11.7816 4.03157Z",
+				fill: "currentColor",
+				fillRule: "evenodd",
+				clipRule: "evenodd"
+			})
+		});
+	}
+	function IconJSON() {
+		return o("svg", {
+			xmlns: "http://www.w3.org/2000/svg",
+			viewBox: "0 0 24 24",
+			className: "ce-icon-md",
+			style: {
+				marginInline: "-2px",
+				marginTop: "2px"
+			},
+			"stroke-width": "2",
+			stroke: "currentColor",
+			fill: "none",
+			strokeLinecap: "round",
+			strokeLinejoin: "round",
+			children: [
+				o("path", {
+					stroke: "none",
+					d: "M0 0h24v24H0z",
+					fill: "none"
+				}),
+				o("path", { d: "M20 16v-8l3 8v-8" }),
+				o("path", { d: "M15 8a2 2 0 0 1 2 2v4a2 2 0 1 1 -4 0v-4a2 2 0 0 1 2 -2z" }),
+				o("path", { d: "M1 8h3v6.5a1.5 1.5 0 0 1 -3 0v-.5" }),
+				o("path", { d: "M7 15a1 1 0 0 0 1 1h1a1 1 0 0 0 1 -1v-2a1 1 0 0 0 -1 -1h-1a1 1 0 0 1 -1 -1v-2a1 1 0 0 1 1 -1h1a1 1 0 0 1 1 1" })
+			]
+		});
+	}
+	function IconZip() {
+		return o("svg", {
+			xmlns: "http://www.w3.org/2000/svg",
+			viewBox: "0 0 24 24",
+			className: "ce-icon",
+			"stroke-width": "2",
+			stroke: "currentColor",
+			fill: "none",
+			strokeLinecap: "round",
+			strokeLinejoin: "round",
+			children: [
+				o("path", {
+					stroke: "none",
+					d: "M0 0h24v24H0z",
+					fill: "none"
+				}),
+				o("path", { d: "M6 20.735a2 2 0 0 1 -1 -1.735v-14a2 2 0 0 1 2 -2h7l5 5v11a2 2 0 0 1 -2 2h-1" }),
+				o("path", { d: "M11 17a2 2 0 0 1 2 2v2a1 1 0 0 1 -1 1h-2a1 1 0 0 1 -1 -1v-2a2 2 0 0 1 2 -2z" }),
+				o("path", { d: "M11 5l-1 0" }),
+				o("path", { d: "M13 7l-1 0" }),
+				o("path", { d: "M11 9l-1 0" }),
+				o("path", { d: "M13 11l-1 0" }),
+				o("path", { d: "M11 13l-1 0" }),
+				o("path", { d: "M13 15l-1 0" })
+			]
+		});
+	}
+	function IconLoading({ className, style }) {
+		return o("span", {
+			style: {
+				display: "inline-flex",
+				animation: "1.4s linear 0s infinite normal none running ce-rotate"
+			},
+			children: o("svg", {
+				xmlns: "http://www.w3.org/2000/svg",
+				viewBox: "22 22 44 44",
+				className,
+				style: {
+					animation: "1.4s ease-in-out 0s infinite normal none running ce-circular-dash",
+					...style
+				},
+				fill: "none",
+				stroke: "currentColor",
+				"stroke-width": "2",
+				children: o("circle", {
+					cx: "44",
+					cy: "44",
+					r: "20.2",
+					fill: "none",
+					stroke: "currentColor",
+					"stroke-width": "3.6"
+				})
+			})
+		});
+	}
+	function IconCheckBox() {
+		return o("svg", {
+			xmlns: "http://www.w3.org/2000/svg",
+			viewBox: "0 0 24 24",
+			style: {
+				width: "1em",
+				height: "1em",
+				display: "inline-block"
+			},
+			fill: "currentColor",
+			children: o("path", { d: "M19 5v14H5V5h14m0-2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2z" })
+		});
+	}
+	function IconCheckBoxChecked({ className }) {
+		return o("svg", {
+			xmlns: "http://www.w3.org/2000/svg",
+			viewBox: "0 0 24 24",
+			className,
+			style: {
+				width: "1em",
+				height: "1em",
+				display: "inline-block"
+			},
+			fill: "currentColor",
+			children: o("path", { d: "M19 3H5c-1.11 0-2 .9-2 2v14c0 1.1.89 2 2 2h14c1.11 0 2-.9 2-2V5c0-1.1-.89-2-2-2zm-9 14l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z" })
+		});
+	}
+	function IconTrash({ className, style }) {
+		return o("svg", {
+			xmlns: "http://www.w3.org/2000/svg",
+			viewBox: "0 0 24 24",
+			className,
+			style,
+			fill: "none",
+			"stroke-linecap": "round",
+			"stroke-linejoin": "round",
+			children: [
+				o("path", {
+					stroke: "none",
+					d: "M0 0h24v24H0z",
+					fill: "none"
+				}),
+				o("path", {
+					d: "M20 6a1 1 0 0 1 .117 1.993l-.117 .007h-.081l-.919 11a3 3 0 0 1 -2.824 2.995l-.176 .005h-8c-1.598 0 -2.904 -1.249 -2.992 -2.75l-.005 -.167l-.923 -11.083h-.08a1 1 0 0 1 -.117 -1.993l.117 -.007h16z",
+					"stroke-width": "0",
+					fill: "currentColor"
+				}),
+				o("path", {
+					d: "M14 2a2 2 0 0 1 2 2a1 1 0 0 1 -1.993 .117l-.007 -.117h-4l-.007 .117a1 1 0 0 1 -1.993 -.117a2 2 0 0 1 1.85 -1.995l.15 -.005h4z",
+					"stroke-width": "0",
+					fill: "currentColor"
+				})
+			]
+		});
+	}
+	function IconUpload({ className, style }) {
+		return o("svg", {
+			xmlns: "http://www.w3.org/2000/svg",
+			viewBox: "0 0 24 24",
+			className,
+			style,
+			fill: "none",
+			"stroke-linecap": "round",
+			"stroke-linejoin": "round",
+			children: [
+				o("path", {
+					stroke: "none",
+					d: "M0 0h24v24H0z",
+					fill: "none"
+				}),
+				o("path", {
+					stroke: "currentColor",
+					d: "M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2 -2v-2"
+				}),
+				o("path", {
+					stroke: "currentColor",
+					d: "M7 9l5 -5l5 5"
+				}),
+				o("path", {
+					stroke: "currentColor",
+					d: "M12 4l0 12"
+				})
+			]
+		});
+	}
+	var TIMEOUT = 2500;
+	var MenuItem = ({ text, successText, disabled = false, title, ariaLabel, icon: Icon, onClick, className }) => {
+		const [loading, setLoading] = h(false);
+		const [succeed, setSucceed] = h(false);
+		const handleClick = typeof onClick === "function" ? async (e) => {
+			e.preventDefault();
+			if (loading) return;
+			try {
+				setLoading(true);
+				if (await onClick()) {
+					setSucceed(true);
+					setTimeout(() => setSucceed(false), TIMEOUT);
+				}
+			} catch (error) {
+				console.error(error);
+			} finally {
+				setLoading(false);
+			}
+		} : void 0;
+		const handleKeyDown = (e) => {
+			if (e.key !== "Enter" && e.key !== " ") return;
+			e.preventDefault();
+			e.currentTarget.click();
+		};
+		return o("div", {
+			className: `ce-menu-item ${className ?? ""}`,
+			role: "button",
+			tabIndex: disabled ? -1 : 0,
+			onClick: handleClick,
+			onTouchStart: handleClick,
+			onKeyDown: handleKeyDown,
+			disabled,
+			"aria-disabled": disabled || void 0,
+			"aria-busy": loading || void 0,
+			"aria-label": ariaLabel,
+			title,
+			children: loading ? o("div", {
+				className: "ce-menu-item-loading",
+				children: o(IconLoading, { className: "ce-icon" })
+			}) : o(k$1, { children: [Icon && o(Icon, {}), o("span", {
+				className: "ce-menu-item-text",
+				children: succeed && successText ? successText : text
+			})] })
+		});
+	};
+	function useGMStorage(key, initialValue) {
+		const [storedValue, setStoredValue] = h(() => ScriptStorage.get(key) ?? initialValue);
+		return [storedValue, T$1((value) => {
+			setStoredValue(value);
+			ScriptStorage.set(key, value);
+		}, [key])];
+	}
+	var defaultFormat = "ChatGPT-{title}";
+	var defaultExportAllLimit = 200;
+	var defaultImageMode = "embed";
+	var defaultExportMetaList = [{
+		name: "title",
+		value: "{title}"
+	}, {
+		name: "source",
+		value: "{source}"
+	}];
+	function readExportSettings() {
+		const enableMeta = ScriptStorage.get("exporter:enable_meta") ?? false;
+		return {
+			format: ScriptStorage.get("exporter:filename_format") ?? defaultFormat,
+			metaList: enableMeta ? ScriptStorage.get("exporter:meta_list") ?? defaultExportMetaList : []
+		};
+	}
+	var SettingContext = G({
+		format: defaultFormat,
+		setFormat: (_) => {},
+		enableTimestamp: false,
+		setEnableTimestamp: (_) => {},
+		timeStamp24H: false,
+		setTimeStamp24H: (_) => {},
+		enableTimestampHTML: false,
+		setEnableTimestampHTML: (_) => {},
+		enableTimestampMarkdown: false,
+		setEnableTimestampMarkdown: (_) => {},
+		enableMeta: false,
+		setEnableMeta: (_) => {},
+		exportMetaList: defaultExportMetaList,
+		setExportMetaList: (_) => {},
+		enableThinking: false,
+		setEnableThinking: (_) => {},
+		enableSources: true,
+		setEnableSources: (_) => {},
+		imageMode: defaultImageMode,
+		setImageMode: (_) => {},
+		exportAllLimit: defaultExportAllLimit,
+		setExportAllLimit: (_) => {},
+		resetDefault: () => {}
+	});
+	var SettingProvider = ({ children }) => {
+		const [format, setFormat] = useGMStorage(KEY_FILENAME_FORMAT, defaultFormat);
+		const [enableTimestamp, setEnableTimestamp] = useGMStorage(KEY_TIMESTAMP_ENABLED, false);
+		const [timeStamp24H, setTimeStamp24H] = useGMStorage(KEY_TIMESTAMP_24H, false);
+		const [enableTimestampHTML, setEnableTimestampHTML] = useGMStorage(KEY_TIMESTAMP_HTML, false);
+		const [enableTimestampMarkdown, setEnableTimestampMarkdown] = useGMStorage(KEY_TIMESTAMP_MARKDOWN, false);
+		const [enableMeta, setEnableMeta] = useGMStorage(KEY_META_ENABLED, false);
+		const [exportMetaList, setExportMetaList] = useGMStorage(KEY_META_LIST, defaultExportMetaList);
+		const [enableThinking, setEnableThinking] = useGMStorage(KEY_THINKING_ENABLED, false);
+		const [enableSources, setEnableSources] = useGMStorage(KEY_SOURCES_ENABLED, true);
+		const [imageMode, setImageMode] = useGMStorage(KEY_IMAGE_MODE, defaultImageMode);
+		const [exportAllLimit, setExportAllLimit] = useGMStorage(KEY_EXPORT_ALL_LIMIT, defaultExportAllLimit);
+		const resetDefault = T$1(() => {
+			setFormat(defaultFormat);
+			setEnableTimestamp(false);
+			setEnableMeta(false);
+			setExportMetaList(defaultExportMetaList);
+			setEnableThinking(false);
+			setEnableSources(true);
+			setImageMode(defaultImageMode);
+			setExportAllLimit(defaultExportAllLimit);
+		}, [
+			setFormat,
+			setEnableTimestamp,
+			setEnableMeta,
+			setExportMetaList,
+			setEnableThinking,
+			setEnableSources,
+			setImageMode,
+			setExportAllLimit
+		]);
+		const value = F$1(() => ({
+			format,
+			setFormat,
+			enableTimestamp,
+			setEnableTimestamp,
+			timeStamp24H,
+			setTimeStamp24H,
+			enableTimestampHTML,
+			setEnableTimestampHTML,
+			enableTimestampMarkdown,
+			setEnableTimestampMarkdown,
+			enableMeta,
+			setEnableMeta,
+			exportMetaList,
+			setExportMetaList,
+			enableThinking,
+			setEnableThinking,
+			enableSources,
+			setEnableSources,
+			imageMode,
+			setImageMode,
+			exportAllLimit,
+			setExportAllLimit,
+			resetDefault
+		}), [
+			format,
+			setFormat,
+			enableTimestamp,
+			setEnableTimestamp,
+			timeStamp24H,
+			setTimeStamp24H,
+			enableTimestampHTML,
+			setEnableTimestampHTML,
+			enableTimestampMarkdown,
+			setEnableTimestampMarkdown,
+			enableMeta,
+			setEnableMeta,
+			exportMetaList,
+			setExportMetaList,
+			enableThinking,
+			setEnableThinking,
+			enableSources,
+			setEnableSources,
+			imageMode,
+			setImageMode,
+			exportAllLimit,
+			setExportAllLimit,
+			resetDefault
+		]);
+		return o(SettingContext.Provider, {
+			value,
+			children
+		});
+	};
+	var useSettingContext = () => q$1(SettingContext);
+	_css("/*\n * The exporter owns all of its styles. The only things it takes from\n * ChatGPT are the theme variables below, each with a fallback so the UI\n * still works when ChatGPT renames or drops one, and the light/dark switch.\n */\n\nhtml {\n    --ce-text-primary: var(--color-text-primary, #0d0d0d);\n    --ce-text-secondary: var(--color-text-secondary, #5d5d5d);\n    --ce-text-tertiary: var(--color-text-tertiary, #8f8f8f);\n    --ce-border: var(--color-token-border-default, #0000001a);\n    --ce-border-light: var(--color-token-border-light, #0000000d);\n    --ce-hover: var(--color-token-list-hover-background, #0000000d);\n    /* ChatGPT's switches use this, and it follows the accent in Appearance. */\n    --ce-accent: var(--color-chart-blue, #3a83f7);\n    --ce-menu-arrow: var(--sidebar-surface-secondary, #ececec);\n\n    --ce-control-border: #6f6e77;\n    --ce-menu-surface: #ffffff;\n    --ce-menu-border: #0d0d0d26;\n    --ce-dialog-surface: #f3f3f3;\n    --ce-dialog-surface-plain: #ffffff;\n    --ce-card-surface: #ffffff;\n    --ce-input-surface: #fafafa;\n    --ce-track: rgb(229 231 235);\n    --ce-list-header-surface: #f9fafb;\n}\n\n:is(.dark, [data-theme=\"dark\"]) {\n    --ce-text-primary: var(--color-text-primary, #ededed);\n    --ce-text-secondary: var(--color-text-secondary, #cdcdcd);\n    --ce-text-tertiary: var(--color-text-tertiary, #afafaf);\n    --ce-border: var(--color-token-border-default, #ffffff26);\n    --ce-border-light: var(--color-token-border-light, #ffffff0d);\n    --ce-hover: var(--color-token-list-hover-background, #ffffff1a);\n    --ce-menu-arrow: var(--sidebar-surface-secondary, #212121);\n\n    --ce-menu-surface: #2a2a2a;\n    --ce-menu-border: var(--color-token-border-default, #ffffff26);\n    --ce-dialog-surface: #2a2a2a;\n    --ce-dialog-surface-plain: #2a2a2a;\n    --ce-card-surface: rgb(255 255 255 / 5%);\n    --ce-input-surface: #2f2f2f;\n    --ce-track: rgb(255 255 255 / 10%);\n    --ce-list-header-surface: #1f2937;\n}\n\n/*\n * Reset everything under our roots, so ChatGPT's base styles neither help\n * nor break us. :where() keeps it at zero specificity, so any of our own\n * class rules win over it.\n */\n:where(.ce-root, .ce-root *, .ce-root ::before, .ce-root ::after) {\n    box-sizing: border-box;\n    margin: 0;\n    padding: 0;\n    border: 0 solid;\n}\n\n:where(.ce-root :is(button, input, select, textarea)) {\n    font: inherit;\n    color: inherit;\n}\n\n/* A background drops the native look of a range input, so leave it alone. */\n:where(.ce-root :is(button, input:not([type=\"range\"]), select, textarea)) {\n    background-color: transparent;\n}\n\n:where(.ce-root :is(button, select, [role=\"button\"])) {\n    cursor: pointer;\n}\n\n:where(.ce-root :is(ul, ol)) {\n    list-style: none;\n}\n\n:where(.ce-root svg) {\n    display: block;\n    flex-shrink: 0;\n}\n\n:where(.ce-root [hidden]) {\n    display: none;\n}\n\n.ce-icon {\n    width: 1rem;\n    height: 1rem;\n}\n\n.ce-icon-sm {\n    width: 0.75rem;\n    height: 0.75rem;\n}\n\n.ce-icon-md {\n    width: 1.25rem;\n    height: 1.25rem;\n}\n\n.ce-icon-lg {\n    width: 1.5rem;\n    height: 1.5rem;\n}\n\n.ce-hstack {\n    display: flex;\n    align-items: center;\n    gap: 0.5rem;\n}\n\n.ce-mt-2 {\n    margin-top: 0.5rem;\n}\n\n.ce-truncate {\n    overflow: hidden;\n    text-overflow: ellipsis;\n    white-space: nowrap;\n}\n\n@keyframes ce-fade-in {\n    from {\n        opacity: 0;\n    }\n    to {\n        opacity: 1;\n    }\n}\n\n@keyframes ce-slide-up {\n    from {\n        transform: translateY(100%);\n    }\n    to {\n        transform: translateY(0);\n    }\n}\n\n@keyframes ce-pointer-fade-in {\n    from {\n        opacity: 0;\n        pointer-events: none;\n    }\n    to {\n        opacity: 1;\n        pointer-events: auto;\n    }\n}\n\n@keyframes ce-rotate {\n    from {\n        transform: rotate(0deg);\n    }\n    to {\n        transform: rotate(360deg);\n    }\n}\n\n@keyframes ce-circular-dash {\n    0% {\n        stroke-dasharray: 1px, 200px;\n        stroke-dashoffset: 0;\n    }\n    50% {\n        stroke-dasharray: 100px, 200px;\n        stroke-dashoffset: -15px;\n    }\n    100% {\n        stroke-dasharray: 100px, 200px;\n        stroke-dashoffset: -125px;\n    }\n}\n");
+	_css(".ce-timestamp {\n    display: block;\n    width: 100%;\n    font-size: 0.875rem;\n    line-height: 1.25rem;\n    text-align: right;\n    color: var(--ce-text-tertiary);\n}\n\nspan[data-time-format] {\n    display: none;\n}\n\nbody[data-time-format=\"12\"] span[data-time-format=\"12\"] {\n    display: inline;\n}\n\nbody[data-time-format=\"24\"] span[data-time-format=\"24\"] {\n    display: inline;\n}\n\n.ce-menu-item {\n    display: flex;\n    flex-shrink: 0;\n    align-items: center;\n    gap: 12px;\n    height: 46px;\n    border: 1px solid var(--ce-menu-border);\n    border-radius: 8px;\n    cursor: pointer;\n    transition: background-color 0.2s;\n}\n\n.ce-menu-item[disabled] {\n    filter: brightness(0.5);\n}\n\n.ce-menu-item:not([disabled]):hover {\n    background-color: var(--ce-hover);\n}\n\n.ce-menu-item-loading {\n    display: flex;\n    align-items: center;\n    justify-content: center;\n    width: 100%;\n    height: 100%;\n}\n\n.ce-nav-trigger {\n    min-width: 0;\n    border: 0;\n    color: var(--ce-text-primary);\n}\n\n/* Mark the trigger while its menu is open, like ChatGPT's selected rail items. */\n[data-state=\"open\"] > .ce-nav-trigger {\n    color: var(--ce-text-primary);\n    background-color: var(--ce-hover);\n}\n\n.ce-nav-trigger .ce-menu-item-text {\n    overflow: hidden;\n    text-overflow: ellipsis;\n    white-space: nowrap;\n}\n\n/* Same box as ChatGPT's sidebar rows, so the icon lines up with theirs. */\n.ce-nav-trigger-expanded {\n    margin: 0 0 8px;\n    padding-inline: 10px;\n}\n\n.ce-nav-trigger-collapsed {\n    width: 32px;\n    height: 32px;\n    margin: 0 auto 0.5rem;\n    padding: 0;\n    justify-content: center;\n    gap: 0;\n    border-radius: 8px;\n    color: var(--ce-text-secondary);\n}\n\n.ce-nav-trigger-collapsed .ce-menu-item-text {\n    display: none;\n}\n\n.ce-divider {\n    height: 1px;\n    background-color: var(--ce-border-light);\n}\n\n.ce-card {\n    display: grid;\n    grid-template-columns: repeat(2, minmax(0, 1fr));\n    gap: 4px;\n    padding: 8px;\n    color: var(--ce-text-primary);\n    background-color: var(--ce-menu-surface);\n    border-radius: 1rem;\n    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.12), 0 2px 8px rgba(0, 0, 0, 0.08);\n    transition: opacity 0.2s;\n    animation: ce-fade-in 0.3s;\n}\n\n.ce-card-mobile {\n    animation: ce-slide-up 0.3s;\n}\n\n:is(.dark, [data-theme=\"dark\"]) .ce-card {\n    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4), 0 2px 8px rgba(0, 0, 0, 0.3);\n}\n\n.ce-card .ce-menu-item {\n    column-gap: 8px;\n    padding-inline: 8px;\n}\n\n.ce-dialog .ce-menu-item {\n    padding-inline-start: 8px;\n}\n\n/* HoverCard sets left/top. ChatGPT's main column carries its own z-index,\n   so raise the card above it. Dialogs sit in the top layer, above this. */\n.ce-card {\n    position: fixed;\n    z-index: 999;\n}\n\n.ce-card-arrow {\n    position: absolute;\n    left: -8px;\n    fill: var(--ce-menu-arrow);\n    stroke: var(--ce-menu-border);\n}\n\n.ce-row-half {\n    grid-column: auto / span 1;\n}\n\n.ce-row-full {\n    grid-column: auto / span 2;\n}\n\n.ce-backdrop {\n    display: block;\n    position: fixed;\n    inset: 0;\n    background-color: rgba(0, 0, 0, 0.5);\n    animation: ce-pointer-fade-in 0.3s;\n}\n\n/* The format menu of the download button under an answer. The button itself\n   copies the look of the row it sits in. */\n.ce-answer-menu {\n    position: fixed;\n    z-index: 999;\n    display: flex;\n    flex-direction: column;\n    gap: 4px;\n    padding: 8px;\n    color: var(--ce-text-primary);\n    background-color: var(--ce-menu-surface);\n    border-radius: 1rem;\n    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.12), 0 2px 8px rgba(0, 0, 0, 0.08);\n    animation: ce-fade-in 0.15s;\n}\n\n:is(.dark, [data-theme=\"dark\"]) .ce-answer-menu {\n    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4), 0 2px 8px rgba(0, 0, 0, 0.3);\n}\n\n.ce-answer-menu .ce-menu-item {\n    column-gap: 8px;\n    padding-inline: 8px;\n}\n");
+	var MENU_WIDTH = 168;
+	var MENU_GAP = 4;
+	var VIEWPORT_PADDING$1 = 8;
+	function AnswerExport({ look, getMessageIds }) {
+		const { t } = useTranslation();
+		const [open, setOpen] = h(false);
+		const buttonRef = _$1(null);
+		const menuRef = _$1(null);
+		p(() => {
+			if (!open) return;
+			const onPointerDown = (e) => {
+				const target = e.target;
+				if (buttonRef.current?.contains(target) || menuRef.current?.contains(target)) return;
+				setOpen(false);
+			};
+			const onKeyDown = (e) => {
+				if (e.key !== "Escape") return;
+				setOpen(false);
+				buttonRef.current?.focus();
+			};
+			const close = () => setOpen(false);
+			document.addEventListener("pointerdown", onPointerDown, true);
+			document.addEventListener("keydown", onKeyDown);
+			window.addEventListener("resize", close);
+			document.addEventListener("scroll", close, true);
+			return () => {
+				document.removeEventListener("pointerdown", onPointerDown, true);
+				document.removeEventListener("keydown", onKeyDown);
+				window.removeEventListener("resize", close);
+				document.removeEventListener("scroll", close, true);
+			};
+		}, [open]);
+		y(() => {
+			const button = buttonRef.current;
+			const menu = menuRef.current;
+			if (!open || !button || !menu) return;
+			const rect = button.getBoundingClientRect();
+			const { height } = menu.getBoundingClientRect();
+			const below = rect.bottom + MENU_GAP;
+			const top = below + height + VIEWPORT_PADDING$1 > window.innerHeight ? Math.max(VIEWPORT_PADDING$1, rect.top - MENU_GAP - height) : below;
+			const left = Math.min(Math.max(VIEWPORT_PADDING$1, rect.left), window.innerWidth - MENU_WIDTH - VIEWPORT_PADDING$1);
+			menu.style.top = `${top}px`;
+			menu.style.left = `${left}px`;
+		}, [open]);
+		const run = (exportAnswer) => async () => {
+			const ids = getMessageIds();
+			if (ids.length === 0) return false;
+			const { format, metaList } = readExportSettings();
+			const done = await exportAnswer(format, metaList, ids);
+			if (done) setOpen(false);
+			return done;
+		};
+		const label = t("Download answer");
+		return o(k$1, { children: [o("button", {
+			ref: buttonRef,
+			type: "button",
+			...look.attributes,
+			className: look.className,
+			"data-ce-answer-export": "",
+			"data-state": open ? "open" : "closed",
+			"aria-label": label,
+			title: label,
+			"aria-haspopup": "menu",
+			"aria-expanded": open,
+			onClick: () => setOpen((value) => !value),
+			children: o("span", {
+				className: look.innerClassName,
+				children: o("svg", {
+					"aria-hidden": "true",
+					width: "16",
+					height: "16",
+					viewBox: "0 0 16 16",
+					fill: "none",
+					stroke: "currentColor",
+					"stroke-width": "1.5",
+					"stroke-linecap": "round",
+					"stroke-linejoin": "round",
+					children: o("path", { d: "M8 2v7.5M5 6.75 8 9.75l3-3M2.5 11v1.5a1 1 0 0 0 1 1h9a1 1 0 0 0 1-1V11" })
+				})
+			})
+		}), open && z(o("div", {
+			ref: menuRef,
+			className: "ce-root ce-answer-menu",
+			role: "menu",
+			style: { width: `${MENU_WIDTH}px` },
+			children: [o(MenuItem, {
+				text: t("Markdown"),
+				icon: IconMarkdown,
+				onClick: run(exportToMarkdown)
+			}), o(MenuItem, {
+				text: t("HTML"),
+				icon: FileCode,
+				onClick: run(exportToHtml)
+			})]
+		}), document.body)] });
 	}
 	var Effect = class {
 		_sideEffects = [];
@@ -11236,7 +12591,7 @@
 				target.removeAttribute("srcset");
 				target.src = dataUrl;
 			} catch (error) {
-				console.warn("[ChatGPT Exporter:screenshot] failed to copy image", error);
+				console.warn("[Super ChatGPT Exporter:screenshot] failed to copy image", error);
 			}
 		});
 	}
@@ -11472,7 +12827,7 @@
 			position.set(0);
 			await sleep(500);
 		}
-		if (threadEl.querySelector(HISTORY_SPINNER_SELECTOR)) console.warn("[ChatGPT Exporter:screenshot] history is still loading; exporting the loaded part");
+		if (threadEl.querySelector(HISTORY_SPINNER_SELECTOR)) console.warn("[Super ChatGPT Exporter:screenshot] history is still loading; exporting the loaded part");
 		const snapshots = new Map();
 		const getListOffset = (turn) => turn.getBoundingClientRect().top - scrollRoot.getBoundingClientRect().top + position.get();
 		const getMountedTurns = () => Array.from(threadEl.querySelectorAll(REDESIGNED_TURN_SELECTOR));
@@ -11805,11 +13160,11 @@
 		const desiredHeight = Math.max(1, Math.floor(sourceHeight * desiredScale));
 		const takeTiledScreenshot = async () => {
 			if (!capture) {
-				console.warn("[ChatGPT Exporter:screenshot] tiled capture unavailable");
+				console.warn("[Super ChatGPT Exporter:screenshot] tiled capture unavailable");
 				return null;
 			}
 			if (typeof CompressionStream === "undefined") {
-				console.warn("[ChatGPT Exporter:screenshot] CompressionStream unavailable; using downscaled fallback");
+				console.warn("[Super ChatGPT Exporter:screenshot] CompressionStream unavailable; using downscaled fallback");
 				return null;
 			}
 			const tileHeight = Math.max(1, Math.min(MAX_SCREENSHOT_DIMENSION, Math.floor(MAX_TILE_PIXELS / desiredWidth)));
@@ -11863,14 +13218,14 @@
 			} catch (error) {
 				console.error("Failed to take screenshot", error);
 			}
-			console.log(`ChatGPT Exporter:takeScreenshot with height=${height} width=${width} targetHeight=${targetHeight} targetWidth=${targetWidth}`);
+			console.log(`Super ChatGPT Exporter:takeScreenshot with height=${height} width=${width} targetHeight=${targetHeight} targetWidth=${targetWidth}`);
 			if (currentPass > passLimit) return null;
 			return takeDownscaledScreenshot(additionalScale / 1.4, currentPass + 1);
 		};
 		const shouldTile = desiredHeight > MAX_SCREENSHOT_DIMENSION || desiredWidth * desiredHeight > MAX_SCREENSHOT_DIMENSION * MAX_SCREENSHOT_DIMENSION;
 		let png = shouldTile ? await takeTiledScreenshot() : await takeDownscaledScreenshot();
 		if (!png && shouldTile) {
-			console.warn("[ChatGPT Exporter:screenshot] tiled export failed; using downscaled fallback");
+			console.warn("[Super ChatGPT Exporter:screenshot] tiled export failed; using downscaled fallback");
 			png = await takeDownscaledScreenshot();
 		}
 		return png;
@@ -11940,43 +13295,6 @@
 		};
 		if (oobaData.visible[0] && oobaData.visible[0][0] === "<|BEGIN-VISIBLE-CHAT|>") oobaData.visible[0][0] = "";
 		return JSON.stringify(oobaData, null, 2);
-	}
-	var ASSETS_DIR = "assets";
-	var IMAGE_EXTENSIONS = {
-		"image/jpeg": "jpg",
-		"image/png": "png",
-		"image/gif": "gif",
-		"image/webp": "webp",
-		"image/svg+xml": "svg"
-	};
-	function getImageMode() {
-		return ScriptStorage.get("exporter:image_mode") ?? "embed";
-	}
-	async function extractImageFiles(conversation, assets) {
-		const copy = structuredClone(conversation);
-		await replaceImageSources(copy, async (src) => {
-			const match = /^data:([^;,]*)[^,]*;base64,(.*)$/s.exec(src);
-			if (!match) return null;
-			const [, mimeType, base64] = match;
-			const ext = IMAGE_EXTENSIONS[mimeType.toLowerCase()] ?? "bin";
-			const name = `image-${await hashBase64(base64)}.${ext}`;
-			assets.set(name, base64);
-			return `${ASSETS_DIR}/${name}`;
-		});
-		return copy;
-	}
-	function addImageFilesToZip(zip, assets) {
-		assets.forEach((base64, name) => {
-			zip.file(`${ASSETS_DIR}/${name}`, base64, {
-				base64: true,
-				compression: "STORE"
-			});
-		});
-	}
-	async function hashBase64(base64) {
-		const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
-		const digest = await crypto.subtle.digest("SHA-256", bytes);
-		return Array.from(new Uint8Array(digest).slice(0, 8), (b) => b.toString(16).padStart(2, "0")).join("");
 	}
 	async function exportToJson(fileNameFormat) {
 		if (!checkIfConversationStarted()) {
@@ -12100,174 +13418,6 @@
 	function conversationToJson(conversation) {
 		return JSON.stringify(conversation);
 	}
-	function loadImages(conversation, imageMode) {
-		return imageMode === "omit" ? Promise.resolve(conversation) : withImageAssets(conversation);
-	}
-	async function exportToMarkdown(fileNameFormat, metaList) {
-		if (!checkIfConversationStarted()) {
-			alert(i18n.t("Please start a conversation first"));
-			return false;
-		}
-		if (!checkIfTemporaryChatIsExportable()) {
-			alert(i18n.t("Temporary chat could not be captured"));
-			return false;
-		}
-		const chatId = await getCurrentChatId();
-		const imageMode = getImageMode();
-		const assets = new Map();
-		let rawConversation = await loadImages(await fetchConversation(chatId), imageMode);
-		if (imageMode === "files") rawConversation = await extractImageFiles(rawConversation, assets);
-		const enableThinking = ScriptStorage.get("exporter:enable_thinking") ?? false;
-		const conversation = processConversation(rawConversation, { enableThinking });
-		const markdown = standardizeLineBreaks(conversationToMarkdown(conversation, metaList, imageMode));
-		const fileName = getFileNameWithFormat(fileNameFormat, "md", {
-			title: conversation.title,
-			chatId,
-			createTime: conversation.createTime,
-			updateTime: conversation.updateTime
-		});
-		if (assets.size === 0) {
-			downloadFile(fileName, "text/markdown", markdown);
-			return true;
-		}
-		const zip = new jszip.default();
-		zip.file(fileName, markdown);
-		addImageFilesToZip(zip, assets);
-		downloadFile(fileName.replace(/\.md$/, ".zip"), "application/zip", await generateZip(zip));
-		return true;
-	}
-	async function exportAllToMarkdown(fileNameFormat, apiConversations, metaList, projectName, partIndex, totalParts) {
-		const zip = new jszip.default();
-		const filenameMap = new Map();
-		const enableThinking = ScriptStorage.get("exporter:enable_thinking") ?? false;
-		const imageMode = getImageMode();
-		const assets = new Map();
-		(imageMode === "files" ? await Promise.all(apiConversations.map((x) => extractImageFiles(x, assets))) : apiConversations).map((x) => processConversation(x, { enableThinking })).forEach((conversation) => {
-			let fileName = getFileNameWithFormat(fileNameFormat, "md", {
-				title: conversation.title,
-				chatId: conversation.id,
-				createTime: conversation.createTime,
-				updateTime: conversation.updateTime
-			});
-			if (filenameMap.has(fileName)) {
-				const count = filenameMap.get(fileName) ?? 1;
-				filenameMap.set(fileName, count + 1);
-				fileName = `${fileName.slice(0, -3)} (${count}).md`;
-			} else filenameMap.set(fileName, 1);
-			const content = conversationToMarkdown(conversation, metaList, imageMode);
-			zip.file(fileName, content);
-		});
-		addImageFilesToZip(zip, assets);
-		const blob = await generateZip(zip);
-		downloadFile(buildZipFileName("markdown", projectName, partIndex != null && totalParts != null ? {
-			part: partIndex,
-			total: totalParts
-		} : void 0), "application/zip", blob);
-		return true;
-	}
-	function generateZip(zip) {
-		return zip.generateAsync({
-			type: "blob",
-			compression: "DEFLATE",
-			compressionOptions: { level: 9 }
-		});
-	}
-	function conversationToMarkdown(conversation, metaList, imageMode) {
-		const { id, title, conversationNodes } = conversation;
-		const _metaList = resolveMetaList(metaList, getMetaVariables(conversation, `${baseUrl}/c/${id}`)).map(([name, val]) => `${name}: ${val}`);
-		const frontMatter = _metaList.length > 0 ? `---\n${_metaList.join("\n")}\n---\n\n` : "";
-		const enableTimestamp = ScriptStorage.get("exporter:enable_timestamp") ?? false;
-		const timeStampMarkdown = ScriptStorage.get("exporter:timestamp_markdown") ?? false;
-		const timeStamp24H = ScriptStorage.get("exporter:timestamp_24h") ?? false;
-		const enableSources = ScriptStorage.get("exporter:enable_sources") ?? true;
-		const renderImage = imageMode === "omit" ? () => "[image]" : (src) => `![image](${src})`;
-		return `${frontMatter}# ${title}\n\n${conversationNodes.map(({ message, thinking }) => {
-			if (!message || !message.content) return null;
-			if (shouldSkipMessageInExport(message)) return null;
-			const timestamp = message?.create_time ?? "";
-			const showTimestamp = enableTimestamp && timeStampMarkdown && timestamp;
-			let timestampHtml = "";
-			if (showTimestamp) {
-				const date = new Date(timestamp * 1e3);
-				const conversationTime = date.toLocaleTimeString("en-US", {
-					hour: "2-digit",
-					minute: "2-digit",
-					hour12: !timeStamp24H
-				});
-				timestampHtml = `<time datetime="${date.toISOString()}" title="${date.toLocaleString()}">${conversationTime}</time>\n\n`;
-			}
-			const author = transformAuthor(message.author);
-			const thinkingBlock = thinking ? formatThinkingMarkdown(thinking) : "";
-			const postSteps = [];
-			if (message.author.role === "assistant") {
-				postSteps.push((input) => transformContentReferences(input, message.metadata, {
-					includeSourceList: enableSources,
-					sourceListLabel: i18n.t("Sources")
-				}));
-				postSteps.push((input) => transformFootNotes$1(input, message.metadata));
-			}
-			if (message.author.role === "assistant") postSteps.push((input) => {
-				const { text, restore } = protectMath(input);
-				return restore(toMarkdown(fromMarkdown(text), text));
-			});
-			const postProcess = (input) => postSteps.reduce((acc, fn) => fn(acc), input);
-			const content = transformContent$1(message.content, message.metadata, postProcess, renderImage);
-			const attachments = getFileAttachmentNames(message).map((name) => `- 📎 ${name}`).join("\n");
-			const attachmentsBlock = attachments ? `\n\n${attachments}` : "";
-			return `#### ${author}:\n${timestampHtml}${thinkingBlock}${content}${attachmentsBlock}`;
-		}).filter(Boolean).join("\n\n")}`;
-	}
-	function transformFootNotes$1(input, metadata) {
-		const footNoteMarkRegex = /【(\d+)†\((.+?)\)】/g;
-		const citationList = [];
-		return `${input.replace(footNoteMarkRegex, (match, citeIndex, _evidenceText) => {
-			const citation = metadata?.citations?.find((cite) => cite.metadata?.extra?.cited_message_idx === +citeIndex);
-			if (citation) {
-				citationList.push(citation);
-				return `[^${citeIndex}]`;
-			}
-			return match;
-		})}\n\n${citationList.map((citation) => {
-			return `[^${citation.metadata?.extra?.cited_message_idx ?? 1}]: ${citation.metadata?.title ?? "No title"}`;
-		}).join("\n")}`;
-	}
-	function transformContent$1(content, metadata, postProcess, renderImage) {
-		switch (content.content_type) {
-			case "text": return postProcess(content.parts?.join("\n") || "");
-			case "code": return postProcess(`Code:\n\`\`\`\n${content.text}\n\`\`\``);
-			case "execution_output":
-				if (metadata?.aggregate_result?.messages) return metadata.aggregate_result.messages.filter((msg) => msg.message_type === "image").map((msg) => renderImage(msg.image_url)).join("\n");
-				return postProcess(`Result:\n\`\`\`\n${content.text}\n\`\`\`` || "");
-			case "tether_quote": return postProcess(`> ${content.title || content.text || ""}`);
-			case "tether_browsing_code": return postProcess("");
-			case "tether_browsing_display": {
-				const metadataList = metadata?._cite_metadata?.metadata_list;
-				if (Array.isArray(metadataList) && metadataList.length > 0) return postProcess(metadataList.map(({ title, url }) => `> [${title}](${url})`).join("\n"));
-				return postProcess("");
-			}
-			case "multimodal_text": return content.parts?.map((part) => {
-				if (typeof part === "string") return postProcess(part);
-				if (part.content_type === "image_asset_pointer") return renderImage(part.asset_pointer);
-				if (part.content_type === "audio_transcription") return `[audio] ${part.text}`;
-				if (part.content_type === "audio_asset_pointer") return null;
-				if (part.content_type === "real_time_user_audio_video_asset_pointer") return null;
-				return postProcess("[Unsupported multimodal content]");
-			}).join("\n") || "";
-			default:
-				console.warn("[Exporter] Unsupported Content:", content.content_type, content);
-				return postProcess(`[Unsupported Content: ${content.content_type}]`);
-		}
-	}
-	function formatThinkingMarkdown(thinking) {
-		const durationLabel = thinking.durationSeconds != null ? `Thought for ${thinking.durationSeconds} seconds` : "Thinking";
-		const parts = [];
-		if (thinking.activities?.length) parts.push(thinking.activities.map((a) => `- ${a}`).join("\n"));
-		const thoughts = thinking.thoughts.map((t) => t.content || t.summary).filter(Boolean).join("\n\n");
-		if (thoughts) parts.push(thoughts);
-		const body = parts.join("\n\n");
-		if (!body) return "";
-		return `<details>\n<summary>${durationLabel}</summary>\n\n${body}\n\n</details>\n\n`;
-	}
 	function copyToClipboard(text) {
 		try {
 			navigator.clipboard.writeText(text);
@@ -12360,30 +13510,6 @@
 	function subscribe$1(callback) {
 		window.addEventListener("resize", callback);
 		return () => window.removeEventListener("resize", callback);
-	}
-	var _ = 0;
-	function o(o, e, n, t, f, l) {
-		var s, u, a = {};
-		for (u in e) "ref" == u ? s = e[u] : a[u] = e[u];
-		var i = {
-			type: o,
-			props: a,
-			key: n,
-			ref: s,
-			__k: null,
-			__: null,
-			__b: 0,
-			__e: null,
-			__d: void 0,
-			__c: null,
-			__h: null,
-			constructor: void 0,
-			__v: --_,
-			__source: f,
-			__self: l
-		};
-		if ("function" == typeof o && (s = o.defaultProps)) for (u in s) void 0 === a[u] && (a[u] = s[u]);
-		return l$1.vnode && l$1.vnode(i), i;
 	}
 	function Dialog({ open, ...props }) {
 		if (!open) return null;
@@ -12643,247 +13769,6 @@
 		}
 	};
 	_css(".ce-checkbox {\n    position: relative;\n    display: flex;\n    font-size: 16px;\n    vertical-align: middle;\n}\n\n.ce-checkbox * {\n    cursor: pointer;\n}\n\n.ce-checkbox[disabled] {\n    opacity: 0.7;\n}\n\n.ce-checkbox[disabled] * {\n    cursor: not-allowed;\n}\n\n.ce-checkbox input {\n    position: absolute;\n    opacity: 0;\n    width: 100%;\n    height: 100%;\n    top: 0;\n    left: 0;\n    margin: 0;\n    padding: 0;\n}\n\n.ce-checkbox-icon {\n    display: inline-flex;\n    align-items: center;\n    position: relative;\n    vertical-align: middle;\n    font-size: 1.5rem;\n}\n\n.ce-checkbox input:checked ~ svg {\n    color: var(--ce-accent);\n}\n\n.ce-checkbox-label {\n    margin-left: 0.5rem;\n    font-size: 1rem;\n    line-height: 1.5;\n}\n");
-	function FileCode() {
-		return o("svg", {
-			xmlns: "http://www.w3.org/2000/svg",
-			viewBox: "0 0 384 512",
-			className: "ce-icon",
-			fill: "currentColor",
-			children: o("path", { d: "M64 0C28.7 0 0 28.7 0 64V448c0 35.3 28.7 64 64 64H320c35.3 0 64-28.7 64-64V160H256c-17.7 0-32-14.3-32-32V0H64zM256 0V128H384L256 0zM153 289l-31 31 31 31c9.4 9.4 9.4 24.6 0 33.9s-24.6 9.4-33.9 0L71 337c-9.4-9.4-9.4-24.6 0-33.9l48-48c9.4-9.4 24.6-9.4 33.9 0s9.4 24.6 0 33.9zM265 255l48 48c9.4 9.4 9.4 24.6 0 33.9l-48 48c-9.4 9.4-24.6 9.4-33.9 0s-9.4-24.6 0-33.9l31-31-31-31c-9.4-9.4-9.4-24.6 0-33.9s24.6-9.4 33.9 0z" })
-		});
-	}
-	function IconCamera() {
-		return o("svg", {
-			xmlns: "http://www.w3.org/2000/svg",
-			viewBox: "0 0 512 512",
-			className: "ce-icon",
-			fill: "currentColor",
-			children: o("path", { d: "M149.1 64.8L138.7 96H64C28.7 96 0 124.7 0 160V416c0 35.3 28.7 64 64 64H448c35.3 0 64-28.7 64-64V160c0-35.3-28.7-64-64-64H373.3L362.9 64.8C356.4 45.2 338.1 32 317.4 32H194.6c-20.7 0-39 13.2-45.5 32.8zM256 384c-53 0-96-43-96-96s43-96 96-96s96 43 96 96s-43 96-96 96z" })
-		});
-	}
-	function IconMarkdown() {
-		return o("svg", {
-			xmlns: "http://www.w3.org/2000/svg",
-			viewBox: "0 0 640 512",
-			className: "ce-icon",
-			fill: "currentColor",
-			children: o("path", { d: "M593.8 59.1H46.2C20.7 59.1 0 79.8 0 105.2v301.5c0 25.5 20.7 46.2 46.2 46.2h547.7c25.5 0 46.2-20.7 46.1-46.1V105.2c0-25.4-20.7-46.1-46.2-46.1zM338.5 360.6H277v-120l-61.5 76.9-61.5-76.9v120H92.3V151.4h61.5l61.5 76.9 61.5-76.9h61.5v209.2zm135.3 3.1L381.5 256H443V151.4h61.5V256H566z" })
-		});
-	}
-	function IconCopy() {
-		return o("svg", {
-			xmlns: "http://www.w3.org/2000/svg",
-			viewBox: "0 0 512 512",
-			className: "ce-icon",
-			fill: "currentColor",
-			children: o("path", { d: "M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z" })
-		});
-	}
-	function IconArrowRightFromBracket() {
-		return o("svg", {
-			xmlns: "http://www.w3.org/2000/svg",
-			viewBox: "0 0 576 512",
-			className: "ce-icon",
-			fill: "currentColor",
-			children: o("path", { d: "M534.6 278.6c12.5-12.5 12.5-32.8 0-45.3l-128-128c-12.5-12.5-32.8-12.5-45.3 0s-12.5 32.8 0 45.3L434.7 224 224 224c-17.7 0-32 14.3-32 32s14.3 32 32 32l210.7 0-73.4 73.4c-12.5 12.5-12.5 32.8 0 45.3s32.8 12.5 45.3 0l128-128zM192 96c17.7 0 32-14.3 32-32s-14.3-32-32-32l-64 0c-53 0-96 43-96 96l0 256c0 53 43 96 96 96l64 0c17.7 0 32-14.3 32-32s-14.3-32-32-32l-64 0c-17.7 0-32-14.3-32-32l0-256c0-17.7 14.3-32 32-32l64 0z" })
-		});
-	}
-	function IconSetting() {
-		return o("svg", {
-			xmlns: "http://www.w3.org/2000/svg",
-			viewBox: "0 0 15 15",
-			className: "ce-icon",
-			stroke: "currentColor",
-			"stroke-width": "0.5",
-			children: o("path", {
-				d: "M7.07095 0.650238C6.67391 0.650238 6.32977 0.925096 6.24198 1.31231L6.0039 2.36247C5.6249 2.47269 5.26335 2.62363 4.92436 2.81013L4.01335 2.23585C3.67748 2.02413 3.23978 2.07312 2.95903 2.35386L2.35294 2.95996C2.0722 3.2407 2.0232 3.6784 2.23493 4.01427L2.80942 4.92561C2.62307 5.2645 2.47227 5.62594 2.36216 6.00481L1.31209 6.24287C0.924883 6.33065 0.650024 6.6748 0.650024 7.07183V7.92897C0.650024 8.32601 0.924883 8.67015 1.31209 8.75794L2.36228 8.99603C2.47246 9.375 2.62335 9.73652 2.80979 10.0755L2.2354 10.9867C2.02367 11.3225 2.07267 11.7602 2.35341 12.041L2.95951 12.6471C3.24025 12.9278 3.67795 12.9768 4.01382 12.7651L4.92506 12.1907C5.26384 12.377 5.62516 12.5278 6.0039 12.6379L6.24198 13.6881C6.32977 14.0753 6.67391 14.3502 7.07095 14.3502H7.92809C8.32512 14.3502 8.66927 14.0753 8.75705 13.6881L8.99505 12.6383C9.37411 12.5282 9.73573 12.3773 10.0748 12.1909L10.986 12.7653C11.3218 12.977 11.7595 12.928 12.0403 12.6473L12.6464 12.0412C12.9271 11.7604 12.9761 11.3227 12.7644 10.9869L12.1902 10.076C12.3768 9.73688 12.5278 9.37515 12.638 8.99596L13.6879 8.75794C14.0751 8.67015 14.35 8.32601 14.35 7.92897V7.07183C14.35 6.6748 14.0751 6.33065 13.6879 6.24287L12.6381 6.00488C12.528 5.62578 12.3771 5.26414 12.1906 4.92507L12.7648 4.01407C12.9766 3.6782 12.9276 3.2405 12.6468 2.95975L12.0407 2.35366C11.76 2.07292 11.3223 2.02392 10.9864 2.23565L10.0755 2.80989C9.73622 2.62328 9.37437 2.47229 8.99505 2.36209L8.75705 1.31231C8.66927 0.925096 8.32512 0.650238 7.92809 0.650238H7.07095ZM4.92053 3.81251C5.44724 3.44339 6.05665 3.18424 6.71543 3.06839L7.07095 1.50024H7.92809L8.28355 3.06816C8.94267 3.18387 9.5524 3.44302 10.0794 3.81224L11.4397 2.9547L12.0458 3.56079L11.1882 4.92117C11.5573 5.44798 11.8164 6.0575 11.9321 6.71638L13.5 7.07183V7.92897L11.932 8.28444C11.8162 8.94342 11.557 9.55301 11.1878 10.0798L12.0453 11.4402L11.4392 12.0462L10.0787 11.1886C9.55192 11.5576 8.94241 11.8166 8.28355 11.9323L7.92809 13.5002H7.07095L6.71543 11.932C6.0569 11.8162 5.44772 11.5572 4.92116 11.1883L3.56055 12.046L2.95445 11.4399L3.81213 10.0794C3.4431 9.55266 3.18403 8.94326 3.06825 8.2845L1.50002 7.92897V7.07183L3.06818 6.71632C3.18388 6.05765 3.44283 5.44833 3.81171 4.92165L2.95398 3.561L3.56008 2.95491L4.92053 3.81251ZM9.02496 7.50008C9.02496 8.34226 8.34223 9.02499 7.50005 9.02499C6.65786 9.02499 5.97513 8.34226 5.97513 7.50008C5.97513 6.65789 6.65786 5.97516 7.50005 5.97516C8.34223 5.97516 9.02496 6.65789 9.02496 7.50008ZM9.92496 7.50008C9.92496 8.83932 8.83929 9.92499 7.50005 9.92499C6.1608 9.92499 5.07513 8.83932 5.07513 7.50008C5.07513 6.16084 6.1608 5.07516 7.50005 5.07516C8.83929 5.07516 9.92496 6.16084 9.92496 7.50008Z",
-				fill: "currentColor",
-				fillRule: "evenodd",
-				clipRule: "evenodd"
-			})
-		});
-	}
-	function IconCross() {
-		return o("svg", {
-			xmlns: "http://www.w3.org/2000/svg",
-			viewBox: "0 0 15 15",
-			width: "15",
-			height: "15",
-			children: o("path", {
-				d: "M11.7816 4.03157C12.0062 3.80702 12.0062 3.44295 11.7816 3.2184C11.5571 2.99385 11.193 2.99385 10.9685 3.2184L7.50005 6.68682L4.03164 3.2184C3.80708 2.99385 3.44301 2.99385 3.21846 3.2184C2.99391 3.44295 2.99391 3.80702 3.21846 4.03157L6.68688 7.49999L3.21846 10.9684C2.99391 11.193 2.99391 11.557 3.21846 11.7816C3.44301 12.0061 3.80708 12.0061 4.03164 11.7816L7.50005 8.31316L10.9685 11.7816C11.193 12.0061 11.5571 12.0061 11.7816 11.7816C12.0062 11.557 12.0062 11.193 11.7816 10.9684L8.31322 7.49999L11.7816 4.03157Z",
-				fill: "currentColor",
-				fillRule: "evenodd",
-				clipRule: "evenodd"
-			})
-		});
-	}
-	function IconJSON() {
-		return o("svg", {
-			xmlns: "http://www.w3.org/2000/svg",
-			viewBox: "0 0 24 24",
-			className: "ce-icon-md",
-			style: {
-				marginInline: "-2px",
-				marginTop: "2px"
-			},
-			"stroke-width": "2",
-			stroke: "currentColor",
-			fill: "none",
-			strokeLinecap: "round",
-			strokeLinejoin: "round",
-			children: [
-				o("path", {
-					stroke: "none",
-					d: "M0 0h24v24H0z",
-					fill: "none"
-				}),
-				o("path", { d: "M20 16v-8l3 8v-8" }),
-				o("path", { d: "M15 8a2 2 0 0 1 2 2v4a2 2 0 1 1 -4 0v-4a2 2 0 0 1 2 -2z" }),
-				o("path", { d: "M1 8h3v6.5a1.5 1.5 0 0 1 -3 0v-.5" }),
-				o("path", { d: "M7 15a1 1 0 0 0 1 1h1a1 1 0 0 0 1 -1v-2a1 1 0 0 0 -1 -1h-1a1 1 0 0 1 -1 -1v-2a1 1 0 0 1 1 -1h1a1 1 0 0 1 1 1" })
-			]
-		});
-	}
-	function IconZip() {
-		return o("svg", {
-			xmlns: "http://www.w3.org/2000/svg",
-			viewBox: "0 0 24 24",
-			className: "ce-icon",
-			"stroke-width": "2",
-			stroke: "currentColor",
-			fill: "none",
-			strokeLinecap: "round",
-			strokeLinejoin: "round",
-			children: [
-				o("path", {
-					stroke: "none",
-					d: "M0 0h24v24H0z",
-					fill: "none"
-				}),
-				o("path", { d: "M6 20.735a2 2 0 0 1 -1 -1.735v-14a2 2 0 0 1 2 -2h7l5 5v11a2 2 0 0 1 -2 2h-1" }),
-				o("path", { d: "M11 17a2 2 0 0 1 2 2v2a1 1 0 0 1 -1 1h-2a1 1 0 0 1 -1 -1v-2a2 2 0 0 1 2 -2z" }),
-				o("path", { d: "M11 5l-1 0" }),
-				o("path", { d: "M13 7l-1 0" }),
-				o("path", { d: "M11 9l-1 0" }),
-				o("path", { d: "M13 11l-1 0" }),
-				o("path", { d: "M11 13l-1 0" }),
-				o("path", { d: "M13 15l-1 0" })
-			]
-		});
-	}
-	function IconLoading({ className, style }) {
-		return o("span", {
-			style: {
-				display: "inline-flex",
-				animation: "1.4s linear 0s infinite normal none running ce-rotate"
-			},
-			children: o("svg", {
-				xmlns: "http://www.w3.org/2000/svg",
-				viewBox: "22 22 44 44",
-				className,
-				style: {
-					animation: "1.4s ease-in-out 0s infinite normal none running ce-circular-dash",
-					...style
-				},
-				fill: "none",
-				stroke: "currentColor",
-				"stroke-width": "2",
-				children: o("circle", {
-					cx: "44",
-					cy: "44",
-					r: "20.2",
-					fill: "none",
-					stroke: "currentColor",
-					"stroke-width": "3.6"
-				})
-			})
-		});
-	}
-	function IconCheckBox() {
-		return o("svg", {
-			xmlns: "http://www.w3.org/2000/svg",
-			viewBox: "0 0 24 24",
-			style: {
-				width: "1em",
-				height: "1em",
-				display: "inline-block"
-			},
-			fill: "currentColor",
-			children: o("path", { d: "M19 5v14H5V5h14m0-2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2z" })
-		});
-	}
-	function IconCheckBoxChecked({ className }) {
-		return o("svg", {
-			xmlns: "http://www.w3.org/2000/svg",
-			viewBox: "0 0 24 24",
-			className,
-			style: {
-				width: "1em",
-				height: "1em",
-				display: "inline-block"
-			},
-			fill: "currentColor",
-			children: o("path", { d: "M19 3H5c-1.11 0-2 .9-2 2v14c0 1.1.89 2 2 2h14c1.11 0 2-.9 2-2V5c0-1.1-.89-2-2-2zm-9 14l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z" })
-		});
-	}
-	function IconTrash({ className, style }) {
-		return o("svg", {
-			xmlns: "http://www.w3.org/2000/svg",
-			viewBox: "0 0 24 24",
-			className,
-			style,
-			fill: "none",
-			"stroke-linecap": "round",
-			"stroke-linejoin": "round",
-			children: [
-				o("path", {
-					stroke: "none",
-					d: "M0 0h24v24H0z",
-					fill: "none"
-				}),
-				o("path", {
-					d: "M20 6a1 1 0 0 1 .117 1.993l-.117 .007h-.081l-.919 11a3 3 0 0 1 -2.824 2.995l-.176 .005h-8c-1.598 0 -2.904 -1.249 -2.992 -2.75l-.005 -.167l-.923 -11.083h-.08a1 1 0 0 1 -.117 -1.993l.117 -.007h16z",
-					"stroke-width": "0",
-					fill: "currentColor"
-				}),
-				o("path", {
-					d: "M14 2a2 2 0 0 1 2 2a1 1 0 0 1 -1.993 .117l-.007 -.117h-4l-.007 .117a1 1 0 0 1 -1.993 -.117a2 2 0 0 1 1.85 -1.995l.15 -.005h4z",
-					"stroke-width": "0",
-					fill: "currentColor"
-				})
-			]
-		});
-	}
-	function IconUpload({ className, style }) {
-		return o("svg", {
-			xmlns: "http://www.w3.org/2000/svg",
-			viewBox: "0 0 24 24",
-			className,
-			style,
-			fill: "none",
-			"stroke-linecap": "round",
-			"stroke-linejoin": "round",
-			children: [
-				o("path", {
-					stroke: "none",
-					d: "M0 0h24v24H0z",
-					fill: "none"
-				}),
-				o("path", {
-					stroke: "currentColor",
-					d: "M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2 -2v-2"
-				}),
-				o("path", {
-					stroke: "currentColor",
-					d: "M7 9l5 -5l5 5"
-				}),
-				o("path", {
-					stroke: "currentColor",
-					d: "M12 4l0 12"
-				})
-			]
-		});
-	}
 	var CheckBox = ({ className, checked = false, disabled, label, onCheckedChange }) => {
 		const [isChecked, setChecked] = h(checked);
 		const onChange = (e) => {
@@ -12911,134 +13796,6 @@
 			})]
 		});
 	};
-	function useGMStorage(key, initialValue) {
-		const [storedValue, setStoredValue] = h(() => ScriptStorage.get(key) ?? initialValue);
-		return [storedValue, T$1((value) => {
-			setStoredValue(value);
-			ScriptStorage.set(key, value);
-		}, [key])];
-	}
-	var defaultFormat = "ChatGPT-{title}";
-	var defaultExportAllLimit = 200;
-	var defaultImageMode = "embed";
-	var defaultExportMetaList = [{
-		name: "title",
-		value: "{title}"
-	}, {
-		name: "source",
-		value: "{source}"
-	}];
-	var SettingContext = G({
-		format: defaultFormat,
-		setFormat: (_) => {},
-		enableTimestamp: false,
-		setEnableTimestamp: (_) => {},
-		timeStamp24H: false,
-		setTimeStamp24H: (_) => {},
-		enableTimestampHTML: false,
-		setEnableTimestampHTML: (_) => {},
-		enableTimestampMarkdown: false,
-		setEnableTimestampMarkdown: (_) => {},
-		enableMeta: false,
-		setEnableMeta: (_) => {},
-		exportMetaList: defaultExportMetaList,
-		setExportMetaList: (_) => {},
-		enableThinking: false,
-		setEnableThinking: (_) => {},
-		enableSources: true,
-		setEnableSources: (_) => {},
-		imageMode: defaultImageMode,
-		setImageMode: (_) => {},
-		exportAllLimit: defaultExportAllLimit,
-		setExportAllLimit: (_) => {},
-		resetDefault: () => {}
-	});
-	var SettingProvider = ({ children }) => {
-		const [format, setFormat] = useGMStorage(KEY_FILENAME_FORMAT, defaultFormat);
-		const [enableTimestamp, setEnableTimestamp] = useGMStorage(KEY_TIMESTAMP_ENABLED, false);
-		const [timeStamp24H, setTimeStamp24H] = useGMStorage(KEY_TIMESTAMP_24H, false);
-		const [enableTimestampHTML, setEnableTimestampHTML] = useGMStorage(KEY_TIMESTAMP_HTML, false);
-		const [enableTimestampMarkdown, setEnableTimestampMarkdown] = useGMStorage(KEY_TIMESTAMP_MARKDOWN, false);
-		const [enableMeta, setEnableMeta] = useGMStorage(KEY_META_ENABLED, false);
-		const [exportMetaList, setExportMetaList] = useGMStorage(KEY_META_LIST, defaultExportMetaList);
-		const [enableThinking, setEnableThinking] = useGMStorage(KEY_THINKING_ENABLED, false);
-		const [enableSources, setEnableSources] = useGMStorage(KEY_SOURCES_ENABLED, true);
-		const [imageMode, setImageMode] = useGMStorage(KEY_IMAGE_MODE, defaultImageMode);
-		const [exportAllLimit, setExportAllLimit] = useGMStorage(KEY_EXPORT_ALL_LIMIT, defaultExportAllLimit);
-		const resetDefault = T$1(() => {
-			setFormat(defaultFormat);
-			setEnableTimestamp(false);
-			setEnableMeta(false);
-			setExportMetaList(defaultExportMetaList);
-			setEnableThinking(false);
-			setEnableSources(true);
-			setImageMode(defaultImageMode);
-			setExportAllLimit(defaultExportAllLimit);
-		}, [
-			setFormat,
-			setEnableTimestamp,
-			setEnableMeta,
-			setExportMetaList,
-			setEnableThinking,
-			setEnableSources,
-			setImageMode,
-			setExportAllLimit
-		]);
-		const value = F$1(() => ({
-			format,
-			setFormat,
-			enableTimestamp,
-			setEnableTimestamp,
-			timeStamp24H,
-			setTimeStamp24H,
-			enableTimestampHTML,
-			setEnableTimestampHTML,
-			enableTimestampMarkdown,
-			setEnableTimestampMarkdown,
-			enableMeta,
-			setEnableMeta,
-			exportMetaList,
-			setExportMetaList,
-			enableThinking,
-			setEnableThinking,
-			enableSources,
-			setEnableSources,
-			imageMode,
-			setImageMode,
-			exportAllLimit,
-			setExportAllLimit,
-			resetDefault
-		}), [
-			format,
-			setFormat,
-			enableTimestamp,
-			setEnableTimestamp,
-			timeStamp24H,
-			setTimeStamp24H,
-			enableTimestampHTML,
-			setEnableTimestampHTML,
-			enableTimestampMarkdown,
-			setEnableTimestampMarkdown,
-			enableMeta,
-			setEnableMeta,
-			exportMetaList,
-			setExportMetaList,
-			enableThinking,
-			setEnableThinking,
-			enableSources,
-			setEnableSources,
-			imageMode,
-			setImageMode,
-			exportAllLimit,
-			setExportAllLimit,
-			resetDefault
-		]);
-		return o(SettingContext.Provider, {
-			value,
-			children
-		});
-	};
-	var useSettingContext = () => q$1(SettingContext);
 	var exportingRef = { current: false };
 	var conversationCache = new Map();
 	var listCache = null;
@@ -14075,51 +14832,6 @@
 			children: trigger
 		}), card && (isMobile ? card : z(card, document.body))] });
 	}
-	var TIMEOUT = 2500;
-	var MenuItem = ({ text, successText, disabled = false, title, ariaLabel, icon: Icon, onClick, className }) => {
-		const [loading, setLoading] = h(false);
-		const [succeed, setSucceed] = h(false);
-		const handleClick = typeof onClick === "function" ? async (e) => {
-			e.preventDefault();
-			if (loading) return;
-			try {
-				setLoading(true);
-				if (await onClick()) {
-					setSucceed(true);
-					setTimeout(() => setSucceed(false), TIMEOUT);
-				}
-			} catch (error) {
-				console.error(error);
-			} finally {
-				setLoading(false);
-			}
-		} : void 0;
-		const handleKeyDown = (e) => {
-			if (e.key !== "Enter" && e.key !== " ") return;
-			e.preventDefault();
-			e.currentTarget.click();
-		};
-		return o("div", {
-			className: `ce-menu-item ${className ?? ""}`,
-			role: "button",
-			tabIndex: disabled ? -1 : 0,
-			onClick: handleClick,
-			onTouchStart: handleClick,
-			onKeyDown: handleKeyDown,
-			disabled,
-			"aria-disabled": disabled || void 0,
-			"aria-busy": loading || void 0,
-			"aria-label": ariaLabel,
-			title,
-			children: loading ? o("div", {
-				className: "ce-menu-item-loading",
-				children: o(IconLoading, { className: "ce-icon" })
-			}) : o(k$1, { children: [Icon && o(Icon, {}), o("span", {
-				className: "ce-menu-item-text",
-				children: succeed && successText ? successText : text
-			})] })
-		});
-	};
 	function useTitle() {
 		return En(subscribe, getSnapshot);
 	}
@@ -14558,8 +15270,6 @@
 			]
 		});
 	};
-	_css("/*\n * The exporter owns all of its styles. The only things it takes from\n * ChatGPT are the theme variables below, each with a fallback so the UI\n * still works when ChatGPT renames or drops one, and the light/dark switch.\n */\n\nhtml {\n    --ce-text-primary: var(--color-text-primary, #0d0d0d);\n    --ce-text-secondary: var(--color-text-secondary, #5d5d5d);\n    --ce-text-tertiary: var(--color-text-tertiary, #8f8f8f);\n    --ce-border: var(--color-token-border-default, #0000001a);\n    --ce-border-light: var(--color-token-border-light, #0000000d);\n    --ce-hover: var(--color-token-list-hover-background, #0000000d);\n    /* ChatGPT's switches use this, and it follows the accent in Appearance. */\n    --ce-accent: var(--color-chart-blue, #3a83f7);\n    --ce-menu-arrow: var(--sidebar-surface-secondary, #ececec);\n\n    --ce-control-border: #6f6e77;\n    --ce-menu-surface: #ffffff;\n    --ce-menu-border: #0d0d0d26;\n    --ce-dialog-surface: #f3f3f3;\n    --ce-dialog-surface-plain: #ffffff;\n    --ce-card-surface: #ffffff;\n    --ce-input-surface: #fafafa;\n    --ce-track: rgb(229 231 235);\n    --ce-list-header-surface: #f9fafb;\n}\n\n:is(.dark, [data-theme=\"dark\"]) {\n    --ce-text-primary: var(--color-text-primary, #ededed);\n    --ce-text-secondary: var(--color-text-secondary, #cdcdcd);\n    --ce-text-tertiary: var(--color-text-tertiary, #afafaf);\n    --ce-border: var(--color-token-border-default, #ffffff26);\n    --ce-border-light: var(--color-token-border-light, #ffffff0d);\n    --ce-hover: var(--color-token-list-hover-background, #ffffff1a);\n    --ce-menu-arrow: var(--sidebar-surface-secondary, #212121);\n\n    --ce-menu-surface: #2a2a2a;\n    --ce-menu-border: var(--color-token-border-default, #ffffff26);\n    --ce-dialog-surface: #2a2a2a;\n    --ce-dialog-surface-plain: #2a2a2a;\n    --ce-card-surface: rgb(255 255 255 / 5%);\n    --ce-input-surface: #2f2f2f;\n    --ce-track: rgb(255 255 255 / 10%);\n    --ce-list-header-surface: #1f2937;\n}\n\n/*\n * Reset everything under our roots, so ChatGPT's base styles neither help\n * nor break us. :where() keeps it at zero specificity, so any of our own\n * class rules win over it.\n */\n:where(.ce-root, .ce-root *, .ce-root ::before, .ce-root ::after) {\n    box-sizing: border-box;\n    margin: 0;\n    padding: 0;\n    border: 0 solid;\n}\n\n:where(.ce-root :is(button, input, select, textarea)) {\n    font: inherit;\n    color: inherit;\n}\n\n/* A background drops the native look of a range input, so leave it alone. */\n:where(.ce-root :is(button, input:not([type=\"range\"]), select, textarea)) {\n    background-color: transparent;\n}\n\n:where(.ce-root :is(button, select, [role=\"button\"])) {\n    cursor: pointer;\n}\n\n:where(.ce-root :is(ul, ol)) {\n    list-style: none;\n}\n\n:where(.ce-root svg) {\n    display: block;\n    flex-shrink: 0;\n}\n\n:where(.ce-root [hidden]) {\n    display: none;\n}\n\n.ce-icon {\n    width: 1rem;\n    height: 1rem;\n}\n\n.ce-icon-sm {\n    width: 0.75rem;\n    height: 0.75rem;\n}\n\n.ce-icon-md {\n    width: 1.25rem;\n    height: 1.25rem;\n}\n\n.ce-icon-lg {\n    width: 1.5rem;\n    height: 1.5rem;\n}\n\n.ce-hstack {\n    display: flex;\n    align-items: center;\n    gap: 0.5rem;\n}\n\n.ce-mt-2 {\n    margin-top: 0.5rem;\n}\n\n.ce-truncate {\n    overflow: hidden;\n    text-overflow: ellipsis;\n    white-space: nowrap;\n}\n\n@keyframes ce-fade-in {\n    from {\n        opacity: 0;\n    }\n    to {\n        opacity: 1;\n    }\n}\n\n@keyframes ce-slide-up {\n    from {\n        transform: translateY(100%);\n    }\n    to {\n        transform: translateY(0);\n    }\n}\n\n@keyframes ce-pointer-fade-in {\n    from {\n        opacity: 0;\n        pointer-events: none;\n    }\n    to {\n        opacity: 1;\n        pointer-events: auto;\n    }\n}\n\n@keyframes ce-rotate {\n    from {\n        transform: rotate(0deg);\n    }\n    to {\n        transform: rotate(360deg);\n    }\n}\n\n@keyframes ce-circular-dash {\n    0% {\n        stroke-dasharray: 1px, 200px;\n        stroke-dashoffset: 0;\n    }\n    50% {\n        stroke-dasharray: 100px, 200px;\n        stroke-dashoffset: -15px;\n    }\n    100% {\n        stroke-dasharray: 100px, 200px;\n        stroke-dashoffset: -125px;\n    }\n}\n");
-	_css(".ce-timestamp {\n    display: block;\n    width: 100%;\n    font-size: 0.875rem;\n    line-height: 1.25rem;\n    text-align: right;\n    color: var(--ce-text-tertiary);\n}\n\nspan[data-time-format] {\n    display: none;\n}\n\nbody[data-time-format=\"12\"] span[data-time-format=\"12\"] {\n    display: inline;\n}\n\nbody[data-time-format=\"24\"] span[data-time-format=\"24\"] {\n    display: inline;\n}\n\n.ce-menu-item {\n    display: flex;\n    flex-shrink: 0;\n    align-items: center;\n    gap: 12px;\n    height: 46px;\n    border: 1px solid var(--ce-menu-border);\n    border-radius: 8px;\n    cursor: pointer;\n    transition: background-color 0.2s;\n}\n\n.ce-menu-item[disabled] {\n    filter: brightness(0.5);\n}\n\n.ce-menu-item:not([disabled]):hover {\n    background-color: var(--ce-hover);\n}\n\n.ce-menu-item-loading {\n    display: flex;\n    align-items: center;\n    justify-content: center;\n    width: 100%;\n    height: 100%;\n}\n\n.ce-nav-trigger {\n    min-width: 0;\n    border: 0;\n    color: var(--ce-text-primary);\n}\n\n/* Mark the trigger while its menu is open, like ChatGPT's selected rail items. */\n[data-state=\"open\"] > .ce-nav-trigger {\n    color: var(--ce-text-primary);\n    background-color: var(--ce-hover);\n}\n\n.ce-nav-trigger .ce-menu-item-text {\n    overflow: hidden;\n    text-overflow: ellipsis;\n    white-space: nowrap;\n}\n\n/* Same box as ChatGPT's sidebar rows, so the icon lines up with theirs. */\n.ce-nav-trigger-expanded {\n    margin: 0 0 8px;\n    padding-inline: 10px;\n}\n\n.ce-nav-trigger-collapsed {\n    width: 32px;\n    height: 32px;\n    margin: 0 auto 0.5rem;\n    padding: 0;\n    justify-content: center;\n    gap: 0;\n    border-radius: 8px;\n    color: var(--ce-text-secondary);\n}\n\n.ce-nav-trigger-collapsed .ce-menu-item-text {\n    display: none;\n}\n\n.ce-divider {\n    height: 1px;\n    background-color: var(--ce-border-light);\n}\n\n.ce-card {\n    display: grid;\n    grid-template-columns: repeat(2, minmax(0, 1fr));\n    gap: 4px;\n    padding: 8px;\n    color: var(--ce-text-primary);\n    background-color: var(--ce-menu-surface);\n    border-radius: 1rem;\n    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.12), 0 2px 8px rgba(0, 0, 0, 0.08);\n    transition: opacity 0.2s;\n    animation: ce-fade-in 0.3s;\n}\n\n.ce-card-mobile {\n    animation: ce-slide-up 0.3s;\n}\n\n:is(.dark, [data-theme=\"dark\"]) .ce-card {\n    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4), 0 2px 8px rgba(0, 0, 0, 0.3);\n}\n\n.ce-card .ce-menu-item {\n    column-gap: 8px;\n    padding-inline: 8px;\n}\n\n.ce-dialog .ce-menu-item {\n    padding-inline-start: 8px;\n}\n\n/* HoverCard sets left/top. ChatGPT's main column carries its own z-index,\n   so raise the card above it. Dialogs sit in the top layer, above this. */\n.ce-card {\n    position: fixed;\n    z-index: 999;\n}\n\n.ce-card-arrow {\n    position: absolute;\n    left: -8px;\n    fill: var(--ce-menu-arrow);\n    stroke: var(--ce-menu-border);\n}\n\n.ce-row-half {\n    grid-column: auto / span 1;\n}\n\n.ce-row-full {\n    grid-column: auto / span 2;\n}\n\n.ce-backdrop {\n    display: block;\n    position: fixed;\n    inset: 0;\n    background-color: rgba(0, 0, 0, 0.5);\n    animation: ce-pointer-fade-in 0.3s;\n}\n");
 	_css("/* Native <dialog>: the backdrop replaces a separate overlay element. */\n.ce-dialog::backdrop {\n    background-color: rgba(0, 0, 0, 0.44);\n    animation: ce-fade-in 150ms cubic-bezier(0.16, 1, 0.3, 1);\n}\n\n.ce-dialog {\n    color: var(--ce-text-primary);\n    background-color: var(--ce-dialog-surface);\n    border-radius: 6px;\n    box-shadow: hsl(206 22% 7% / 35%) 0px 10px 38px -10px, hsl(206 22% 7% / 20%) 0px 10px 20px -15px;\n    position: fixed;\n    /* The UA sheet sets inset: 0 and margin: auto on a modal <dialog>. */\n    inset: 50% auto auto 50%;\n    margin: 0;\n    border: 0;\n    transform: translate(-50%, -50%);\n    width: 90vw;\n    max-width: 560px;\n    max-height: 85vh;\n    overflow: hidden;\n    padding: 16px 24px;\n    outline: none;\n    animation: ce-content-show 150ms cubic-bezier(0.16, 1, 0.3, 1);\n    display: flex;\n    flex-direction: column;\n}\n\n/* display: flex above would otherwise show a closed <dialog>. */\n.ce-dialog:not([open]) {\n    display: none;\n}\n\n.ce-dialog-plain {\n    background-color: var(--ce-dialog-surface-plain);\n}\n\n:is(.dark, [data-theme=\"dark\"]) .ce-dialog {\n    border: 1px solid #40414f;\n}\n\n.ce-dialog-title {\n    margin: 0 0 16px 0;\n    font-weight: 500;\n    font-size: 20px;\n    line-height: 1.5;\n    flex-shrink: 0;\n}\n\n.ce-dialog-body {\n    flex: 1;\n    min-height: 0;\n    overflow-y: auto;\n    overflow-x: hidden;\n}\n\n.ce-dialog-footer {\n    display: flex;\n    flex-shrink: 0;\n    justify-content: flex-end;\n    padding-top: 16px;\n}\n\n.ce-button {\n    display: inline-flex;\n    align-items: center;\n    justify-content: center;\n    border-radius: 4px;\n    padding: 0 15px;\n    font-size: 15px;\n    line-height: 1;\n    height: 35px;\n}\n.ce-button-strong {\n    font-weight: 700;\n}\n.ce-button-green {\n    background-color: #ddf3e4;\n    color: #18794e;\n}\n.ce-button-green:hover {\n    background-color: #ccebd7;\n}\n.ce-button-red {\n    background-color: #f9d9d9;\n    color: #a71d2a;\n}\n.ce-button-neutral {\n    color: #6f6e77;\n    border: 1px solid #6f6e77;\n    font-size: 13px;\n    height: 26px;\n    padding: 0 8px;\n}\n.ce-button-neutral:hover {\n    background-color: rgba(111, 110, 119, 0.1);\n}\n:is(.dark, [data-theme=\"dark\"]) .ce-button-neutral {\n    color: #a0a0a8;\n    border-color: #a0a0a8;\n}\n:is(.dark, [data-theme=\"dark\"]) .ce-button-neutral:hover {\n    background-color: rgba(160, 160, 168, 0.1);\n}\n.ce-button:disabled,\n.ce-button:disabled:hover {\n    opacity: 0.5;\n    color: #6f6e77;\n    background-color: #e0e0e0;\n    cursor: not-allowed;\n}\n\n.ce-icon-button {\n    border-radius: 100%;\n    height: 25px;\n    width: 25px;\n    display: inline-flex;\n    align-items: center;\n    justify-content: center;\n    color: var(--ce-text-secondary);\n}\n.ce-icon-button:hover {\n    background-color: var(--ce-hover);\n}\n\n.ce-close-button {\n    position: absolute;\n    top: 10px;\n    right: 10px;\n}\n\n.ce-input {\n    width: 100%;\n    flex: 1;\n    display: inline-flex;\n    align-items: center;\n    justify-content: center;\n    border-radius: 4px;\n    padding: 0 10px;\n    font-size: 15px;\n    line-height: 1;\n    color: var(--ce-text-primary);\n    background-color: var(--ce-input-surface);\n    box-shadow: 0 0 0 1px var(--ce-control-border);\n    height: 35px;\n    outline: none;\n}\n\n.ce-select {\n    appearance: none;\n    height: 2rem;\n    padding: 0 2rem 0 0.5rem;\n    width: auto;\n    min-width: 7.5rem;\n    border-radius: 4px;\n    color: var(--ce-text-primary);\n    background-color: var(--ce-input-surface);\n    /* Our own chevron, since appearance: none drops the native one. */\n    background-image: url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%238f8f8f' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4 6l4 4 4-4'/%3E%3C/svg%3E\");\n    background-repeat: no-repeat;\n    background-position: right 0.5rem center;\n    background-size: 1rem;\n    box-shadow: 0 0 0 1px var(--ce-control-border);\n}\n\n.ce-select:disabled {\n    opacity: 0.6;\n    cursor: not-allowed;\n}\n\n/* ── Export dialog ── */\n\n.ce-export-source {\n    display: flex;\n    align-items: center;\n    justify-content: space-between;\n    padding-bottom: 12px;\n    margin-bottom: 12px;\n    border-bottom: 1px solid var(--ce-border);\n    color: var(--ce-text-secondary);\n}\n\n.ce-project-select {\n    display: flex;\n    align-items: center;\n    justify-content: space-between;\n    margin-bottom: 12px;\n    color: var(--ce-text-secondary);\n}\n\n.ce-select-search {\n    width: 100%;\n    padding: 8px 16px;\n    border: 1px solid var(--ce-control-border);\n    border-bottom: none;\n    border-radius: 4px 4px 0 0;\n    font-size: 14px;\n    outline: none;\n    flex-shrink: 0;\n}\n.ce-select-search::placeholder {\n    color: var(--ce-text-tertiary);\n}\n\n.ce-select-toolbar {\n    display: flex;\n    align-items: center;\n    /* Minimum breathing room between the select-all label and the right\n       group once the auto margin collapses under pressure */\n    gap: 12px;\n    padding: 12px 16px;\n    border: 1px solid var(--ce-control-border);\n    border-bottom: none;\n    flex-shrink: 0;\n}\n\n/* CJK labels wrap per-character when the row is squeezed — never shrink it */\n.ce-select-toolbar .ce-checkbox {\n    white-space: nowrap;\n    flex-shrink: 0;\n}\n\n.ce-select-toolbar-end {\n    display: flex;\n    align-items: center;\n    gap: 8px;\n    margin-left: auto;\n    min-width: 0;\n}\n\n.ce-toolbar-loading {\n    display: flex;\n    align-items: center;\n    gap: 4px;\n    min-width: 0;\n    overflow: hidden;\n    white-space: nowrap;\n    font-size: 0.875rem;\n    color: var(--ce-text-tertiary);\n}\n\n.ce-toolbar-status {\n    flex-shrink: 0;\n    height: auto;\n    font-size: 0.75rem;\n    padding: 2px 2rem 2px 0.5rem;\n    width: 8.5rem;\n    text-overflow: ellipsis;\n}\n\n.ce-toolbar-hint {\n    min-width: 0;\n    overflow: hidden;\n    text-overflow: ellipsis;\n    white-space: nowrap;\n    font-size: 0.75rem;\n    color: var(--ce-text-tertiary);\n    /* Highest shrink factor: the hint collapses before the loading\n       indicator starts truncating */\n    flex-shrink: 99;\n}\n\n.ce-toolbar-count {\n    flex-shrink: 0;\n    white-space: nowrap;\n    font-size: 0.875rem;\n    font-weight: 500;\n    font-variant-numeric: tabular-nums;\n    color: var(--ce-text-tertiary);\n}\n\n.ce-select-list {\n    position: relative;\n    width: 100%;\n    flex: 1;\n    min-height: 120px;\n    padding: 12px 16px;\n    overflow-x: hidden;\n    overflow-y: auto;\n    border: 1px solid var(--ce-control-border);\n    border-radius: 0 0 4px 4px;\n    white-space: nowrap;\n}\n\n.ce-select-item {\n    display: flex;\n    align-items: center;\n    gap: 6px;\n    overflow: hidden;\n}\n\n.ce-select-item-empty {\n    color: var(--ce-text-tertiary);\n}\n\n.ce-select-item .ce-checkbox {\n    flex: 1;\n    min-width: 0;\n}\n\n.ce-select-item .ce-checkbox-label {\n    overflow: hidden;\n    text-overflow: ellipsis;\n    white-space: nowrap;\n}\n\n.ce-starred {\n    flex-shrink: 0;\n    color: #f59e0b;\n}\n\n.ce-select-item-meta {\n    flex-shrink: 0;\n    font-size: 0.7rem;\n    color: var(--ce-text-tertiary);\n    white-space: nowrap;\n    font-variant-numeric: tabular-nums;\n    min-width: 6.5rem;\n    text-align: right;\n}\n.ce-select-item-meta-active {\n    color: var(--ce-text-secondary);\n    font-weight: 600;\n}\n\n/* ── Sortable column header row ── */\n.ce-list-header {\n    display: flex;\n    align-items: center;\n    padding: 0 16px;\n    border: 1px solid var(--ce-control-border);\n    border-bottom: none;\n    background: var(--ce-list-header-surface);\n    user-select: none;\n    flex-shrink: 0;\n}\n\n.ce-list-header-cell {\n    flex-shrink: 0;\n    font-size: 0.68rem;\n    font-weight: 600;\n    color: var(--ce-text-tertiary);\n    letter-spacing: 0.03em;\n    text-transform: uppercase;\n    padding: 5px 4px;\n    white-space: nowrap;\n    min-width: 6.5rem;\n    text-align: right;\n}\n.ce-list-header-cell:hover {\n    color: var(--ce-text-primary);\n}\n.ce-list-header-cell-title {\n    flex: 1;\n    text-align: left;\n    padding-left: 28px; /* align with checkbox label */\n}\n.ce-list-header-cell-active {\n    color: var(--ce-accent);\n}\n\n.ce-load-more {\n    display: flex;\n    align-items: center;\n    justify-content: center;\n    gap: 8px;\n    margin: 8px 0 4px;\n}\n\n.ce-muted-count {\n    font-size: 0.75rem;\n    font-variant-numeric: tabular-nums;\n    color: var(--ce-text-tertiary);\n}\n\n.ce-action-bar {\n    display: flex;\n    flex-wrap: wrap;\n    align-items: center;\n    gap: 8px;\n    margin-top: 12px;\n}\n\n.ce-action-bar > .ce-select {\n    flex-shrink: 0;\n}\n\n/* The buttons wrap as one group, so Export never sits alone on its own row.\n   They only wrap among themselves when long labels overflow a full row. */\n.ce-action-buttons {\n    display: flex;\n    flex-wrap: wrap;\n    justify-content: flex-end;\n    flex-shrink: 0;\n    gap: 8px;\n    max-width: 100%;\n    margin-left: auto;\n}\n\n.ce-batch-note {\n    margin-top: 6px;\n    font-size: 0.75rem;\n    text-align: right;\n    color: var(--ce-text-tertiary);\n}\n\n.ce-progress-header {\n    display: flex;\n    align-items: center;\n    justify-content: space-between;\n    gap: 8px;\n    margin: 8px 0 4px;\n}\n\n.ce-progress-name {\n    overflow: hidden;\n    text-overflow: ellipsis;\n    white-space: nowrap;\n    font-size: 0.875rem;\n    color: var(--ce-text-secondary);\n}\n\n.ce-progress-count {\n    flex-shrink: 0;\n    font-size: 0.875rem;\n    font-variant-numeric: tabular-nums;\n    color: var(--ce-text-tertiary);\n}\n\n.ce-progress {\n    width: 100%;\n    height: 10px;\n    margin-bottom: 16px;\n    border-radius: 9999px;\n    background-color: var(--ce-track);\n}\n\n.ce-progress-bar {\n    height: 100%;\n    border-radius: 9999px;\n    background-color: var(--ce-accent);\n}\n\n.ce-progress-bar-waiting {\n    background-color: #f59e0b;\n}\n\n@media (max-width: 480px) {\n    .ce-dialog { max-height: 90vh; }\n    .ce-list-header-cell:last-child { display: none; }\n    .ce-select-item-meta:last-child { display: none; }\n    .ce-action-bar > .ce-select { width: 100%; }\n}\n\n@keyframes ce-content-show {\n    from {\n        opacity: 0;\n        transform: translate(-50%, -48%) scale(0.96);\n    }\n    to {\n        opacity: 1;\n        transform: translate(-50%, -50%) scale(1);\n    }\n}\n");
 	function useCollapsedSidebar(container, isMobile) {
 		const [isCollapsed, setIsCollapsed] = h(false);
@@ -14785,11 +15495,46 @@
 			]) import_sentinel_umd.default.on(selector, syncNavMenu);
 			syncNavMenu();
 			setInterval(syncNavMenu, 1e3);
+			watchAnswerActions();
 			if (isSharePage()) import_sentinel_umd.default.on(`div[role="presentation"] > .w-full > div >.flex.w-full`, (target) => {
 				target.prepend(getMenuContainer());
 			});
 			watchMessageTimestamps();
 		});
+	}
+	function watchAnswerActions() {
+		const hosts = new Map();
+		const mount = (row) => {
+			const last = getLastActionButton(row);
+			if (!last) return;
+			const host = document.createElement("span");
+			host.className = "ce-answer-export";
+			host.style.display = "contents";
+			D$1(o(AnswerExport, {
+				look: readButtonLook(last),
+				getMessageIds: () => getAnswerMessageIds(row)
+			}), host);
+			last.after(host);
+			hosts.set(row, host);
+		};
+		const sync = () => {
+			const rows = new Set(Array.from(document.querySelectorAll(ANSWER_ACTIONS_SELECTOR)).filter((row) => getAnswerMessageIds(row).length > 0));
+			hosts.forEach((host, row) => {
+				if (rows.has(row)) {
+					if (!host.isConnected) getLastActionButton(row)?.after(host);
+					return;
+				}
+				D$1(null, host);
+				host.remove();
+				hosts.delete(row);
+			});
+			rows.forEach((row) => {
+				if (!hosts.has(row)) mount(row);
+			});
+		};
+		import_sentinel_umd.default.on(ANSWER_ACTIONS_SELECTOR, sync);
+		sync();
+		setInterval(sync, 1e3);
 	}
 	function watchMessageTimestamps() {
 		let chatId = "";

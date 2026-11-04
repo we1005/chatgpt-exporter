@@ -7,15 +7,41 @@ interface TransformContentReferenceOptions {
     inlineReferenceMode?: 'expanded' | 'alt'
     includeSourceList?: boolean
     sourceListLabel?: string
+    /** Set to false to leave out image search results, which are remote images */
+    includeImages?: boolean
+    /** Set to false to leave out the citations in the text, the source list can still follow the text */
+    includeCitations?: boolean
 }
 
-const CitationMarkerRegex = /\uE200cite(?:\uE202[^\uE200\uE201]*)+\uE201/gu
+// ChatGPT writes what it draws in place of text as `\uE200name\uE202field\uE202field\uE201`
+const MarkerRegex = /\uE200([a-z_]+)((?:\uE202[^\uE200\uE201]*)*)\uE201/gu
+
+const SpaceLike = /[\u00A0\u202F\u2007\u2060]/u
+const DashLike = /[\u2010-\u2015\u2212]/u
+
+/** `\uE203` and `\uE204` mark a highlighted span, they are not part of the text. */
+function stripHighlightMarkers(input: string): string {
+    return input.replaceAll(/[\uE203\uE204]/gu, '')
+}
 
 export function normalizeCitationText(input: string): string {
-    return input
-        .replaceAll(/[\u00A0\u202F\u2007\u2060]/gu, ' ')
-        .replaceAll(/[\u2010-\u2015\u2212]/gu, '-')
-        .replaceAll(/[\uE203\uE204]/gu, '')
+    return stripHighlightMarkers(input)
+        .replaceAll(new RegExp(SpaceLike, 'gu'), ' ')
+        .replaceAll(new RegExp(DashLike, 'gu'), '-')
+}
+
+/**
+ * Matches `text` where a space or a dash may be written as a look-alike
+ * character. The answer is searched as written, so the dashes, minus signs and
+ * non-breaking spaces of the answer stay untouched.
+ */
+function toLooseRegExp(text: string): RegExp {
+    const source = Array.from(normalizeCitationText(text), (char) => {
+        if (char === ' ') return '[ \\u00A0\\u202F\\u2007\\u2060]'
+        if (char === '-') return '[-\\u2010-\\u2015\\u2212]'
+        return escapeRegExp(char)
+    }).join('')
+    return new RegExp(source, 'gu')
 }
 
 export function transformContentReferences(
@@ -26,7 +52,9 @@ export function transformContentReferences(
     const outputType = options.output ?? 'markdown'
     const inlineReferenceMode = options.inlineReferenceMode ?? 'expanded'
     const contentRefs = metadata?.content_references ?? []
-    let output = normalizeCitationText(input)
+    const includeImages = options.includeImages ?? true
+    const includeCitations = options.includeCitations ?? true
+    let output = stripHighlightMarkers(input)
 
     const sortedRefs = [...contentRefs]
         .filter(ref => ref.type !== 'sources_footnote')
@@ -38,11 +66,10 @@ export function transformContentReferences(
         // ChatGPT draws these code blocks as widgets, but the text already has their Markdown.
         if (ref.type === 'client_defined_widget' && ref.data?.widget_type === 'code_block') continue
 
-        const matchedText = normalizeCitationText(ref.matched_text)
-        if (!matchedText) continue
+        if (!normalizeCitationText(ref.matched_text)) continue
 
-        const replacement = formatInlineReference(ref, outputType, inlineReferenceMode)
-        output = output.replaceAll(matchedText, () => replacement)
+        const replacement = formatInlineReference(ref, outputType, inlineReferenceMode, includeImages, includeCitations)
+        output = output.replace(toLooseRegExp(ref.matched_text), () => replacement)
         if (ref.type === 'file' && replacement) fileReplacements.add(replacement)
     }
 
@@ -52,10 +79,14 @@ export function transformContentReferences(
         output = output.replaceAll(new RegExp(`${escaped}(?:\\s*${escaped})+`, 'g'), () => replacement)
     }
 
-    output = output.replace(CitationMarkerRegex, '')
+    // What no reference describes: links and entities of an interactive reply
+    // keep their text, citations and image carousels (a search query, no image) are dropped
+    output = output.replace(MarkerRegex, (_marker, kind: string, fields: string) => formatMarker(kind, fields.split('\uE202').slice(1), outputType))
 
     if (options.includeSourceList !== false) {
-        const sources = getSourcesFootnoteSources(contentRefs)
+        // A reply of the interactive kind cites search results by id and has no footnote
+        const footnote = getSourcesFootnoteSources(contentRefs)
+        const sources = footnote.length > 0 ? footnote : dedupeSources(metadata?.cited_sources ?? [])
         if (sources.length > 0) {
             output = appendSourcesSection(output, sources, outputType, options.sourceListLabel ?? 'Sources')
         }
@@ -64,8 +95,32 @@ export function transformContentReferences(
     return output
 }
 
-export function formatCitationSource(source: ContentReferenceSource, output: CitationOutput): string {
-    const label = getSourceLabel(source)
+/** Markers in text that no reference describes, such as the thoughts of a reply */
+export function replaceMarkers(input: string, output: CitationOutput): string {
+    return stripHighlightMarkers(input).replace(MarkerRegex, (_marker, kind: string, fields: string) => formatMarker(kind, fields.split('\uE202').slice(1), output))
+}
+
+function formatMarker(kind: string, fields: string[], output: CitationOutput): string {
+    if (kind === 'url') {
+        const [title = '', url = ''] = fields
+        if (!url) return output === 'markdown' ? escapeMarkdownText(title) : title
+        if (output === 'text') return title && title !== url ? `${title} (${url})` : url
+        return `[${escapeMarkdownText(title || url)}](<${escapeMarkdownUrl(url)}>)`
+    }
+
+    if (kind === 'entity') {
+        // ["software", "Name", "what it is"]
+        try {
+            const name = (JSON.parse(fields[0]) as unknown[])[1]
+            if (typeof name === 'string') return output === 'markdown' ? escapeMarkdownText(name) : name
+        }
+        catch {}
+    }
+
+    return ''
+}
+
+export function formatCitationSource(source: ContentReferenceSource, output: CitationOutput, label = getSourceLabel(source)): string {
     const url = source.url?.trim()
 
     if (!url) return output === 'markdown' ? escapeMarkdownText(label) : label
@@ -77,10 +132,18 @@ export function formatCitationSource(source: ContentReferenceSource, output: Cit
     return `[${escapeMarkdownText(label)}](<${escapeMarkdownUrl(url)}>)`
 }
 
-function formatInlineReference(ref: ContentReference, output: CitationOutput, mode: 'expanded' | 'alt'): string {
+const CITATION_TYPES = new Set(['grouped_webpages', 'webpage', 'nav_list'])
+
+function formatInlineReference(ref: ContentReference, output: CitationOutput, mode: 'expanded' | 'alt', includeImages: boolean, includeCitations: boolean): string {
     if (ref.type === 'client_defined_widget' && ref.data?.widget_type === 'charts_widget_v2') {
         return formatChart(ref.data.content as ChartContent | undefined)
     }
+
+    // Image search results are remote images, their alt text is an image too
+    if (!includeImages && (ref.type === 'image_group' || ref.type === 'image_v2')) return ''
+
+    // A citation is a link to the page a sentence rests on. Product names, charts and the like are content.
+    if (!includeCitations && (CITATION_TYPES.has(ref.type) || getInlineSources(ref).length > 0)) return ''
 
     if (mode === 'alt') return formatAlt(ref.alt)
 
@@ -94,7 +157,7 @@ function formatInlineReference(ref: ContentReference, output: CitationOutput, mo
 
     if (sources.length > 0) {
         const separator = output === 'markdown' ? ', ' : '; '
-        return `(${sources.map(source => formatCitationSource(source, output)).join(separator)})`
+        return `(${formatCitationSources(sources, output).join(separator)})`
     }
 
     return formatAlt(ref.alt)
@@ -158,6 +221,25 @@ function formatAlt(alt: string | undefined): string {
     return alt?.replaceAll(/\[([^\]]*)\]\(\)/g, '$1') ?? ''
 }
 
+/**
+ * Sources of one citation often share a site name, such as `GitHub +5`.
+ * A name that more than one source has is replaced by the page title, so the
+ * links can be told apart.
+ */
+function formatCitationSources(sources: ContentReferenceSource[], output: CitationOutput): string[] {
+    const counts = new Map<string, number>()
+    for (const source of sources) {
+        const label = getSourceLabel(source)
+        counts.set(label, (counts.get(label) ?? 0) + 1)
+    }
+
+    return sources.map((source) => {
+        const label = getSourceLabel(source)
+        const unique = counts.get(label) === 1
+        return formatCitationSource(source, output, unique ? label : source.title?.trim() || label)
+    })
+}
+
 function getInlineSources(ref: ContentReference): ContentReferenceSource[] {
     const sources: ContentReferenceSource[] = []
 
@@ -206,11 +288,11 @@ function appendSourcesSection(input: string, sources: ContentReferenceSource[], 
         ? [
                 `**${escapeMarkdownText(label)}:**`,
                 '',
-                ...sources.map(source => `- ${formatCitationSource(source, output)}`),
+                ...formatCitationSources(sources, output).map(entry => `- ${entry}`),
             ].join('\n')
         : [
                 `${label}:`,
-                ...sources.map((source, index) => `${index + 1}. ${formatCitationSource(source, output)}`),
+                ...formatCitationSources(sources, output).map((entry, index) => `${index + 1}. ${entry}`),
             ].join('\n')
 
     return trimmed ? `${trimmed}\n\n${sourceList}` : sourceList
@@ -237,11 +319,14 @@ function getSourceLabel(source: ContentReferenceSource): string {
         || 'Source'
 }
 
-function escapeMarkdownText(input: string): string {
+/** A pipe splits a table cell, a page title such as `Docs | Site` is common */
+export function escapeMarkdownText(input: string): string {
     return input
         .replaceAll('\\', '\\\\')
-        .replaceAll('[', '\\[')
-        .replaceAll(']', '\\]')
+        // Character references, `\\[` would be taken for the start of a formula
+        .replaceAll('[', '&#91;')
+        .replaceAll(']', '&#93;')
+        .replaceAll('|', '\\|')
         .replaceAll('\n', ' ')
 }
 
@@ -249,6 +334,7 @@ function escapeMarkdownUrl(input: string): string {
     return input
         .replaceAll('<', '%3C')
         .replaceAll('>', '%3E')
+        .replaceAll('|', '%7C')
         .replaceAll('\n', '')
 }
 

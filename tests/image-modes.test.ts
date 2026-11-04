@@ -88,7 +88,7 @@ describe('exportAllToMarkdown image modes', () => {
         settings.imageMode = 'omit'
         const zip = await exportZip([conversation('a', { upload: PNG, output: JPEG })])
         const markdown = await zip.file('a.md')!.async('string')
-        expect(markdown).toContain('[image]\nlook')
+        expect(markdown).toContain('[image]\n\nlook')
         expect(markdown).not.toContain('data:')
         expect(markdown).not.toContain('![image]')
     })
@@ -117,11 +117,18 @@ describe('exportAllToMarkdown image modes', () => {
         expect((a.mapping.m0.message!.content as any).parts[0].asset_pointer).toBe(PNG)
     })
 
-    it('keeps sources that are not data uris', async () => {
-        settings.imageMode = 'files'
-        const zip = await exportZip([conversation('a', { upload: 'sediment://file_1' })])
-        expect(Object.keys(zip.files).some(name => name.startsWith('assets/'))).toBe(false)
-        expect(await zip.file('a.md')!.async('string')).toContain('![image](sediment://file_1)')
+    it('leaves out images that ChatGPT loads from a URL', async () => {
+        for (const src of ['sediment://file_1', 'https://images.example/a.png', '//images.example/a.png']) {
+            for (const mode of ['embed', 'files'] as const) {
+                settings.imageMode = mode
+                const zip = await exportZip([conversation('a', { upload: src })])
+                expect(Object.keys(zip.files).some(name => name.startsWith('assets/'))).toBe(false)
+                const markdown = await zip.file('a.md')!.async('string')
+                expect(markdown).not.toContain('![')
+                expect(markdown).not.toContain(src)
+                expect(markdown).toContain('look')
+            }
+        }
     })
 })
 

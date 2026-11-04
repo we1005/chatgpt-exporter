@@ -15,6 +15,7 @@ import {
     KEY_TIMESTAMP_MARKDOWN,
 } from '../constants'
 import { useGMStorage } from '../hooks/useGMStorage'
+import { ScriptStorage } from '../utils/storage'
 
 const defaultFormat = 'ChatGPT-{title}'
 const defaultExportAllLimit = 200
@@ -35,6 +36,15 @@ const defaultExportMetaList: ExportMeta[] = [
     { name: 'title', value: '{title}' },
     { name: 'source', value: '{source}' },
 ]
+
+/** The file name format and meta of the settings now, for what lives outside the settings provider */
+export function readExportSettings(): { format: string, metaList: ExportMeta[] } {
+    const enableMeta = ScriptStorage.get<boolean>(KEY_META_ENABLED) ?? false
+    return {
+        format: ScriptStorage.get<string>(KEY_FILENAME_FORMAT) ?? defaultFormat,
+        metaList: enableMeta ? ScriptStorage.get<ExportMeta[]>(KEY_META_LIST) ?? defaultExportMetaList : [],
+    }
+}
 
 const SettingContext = createContext({
     format: defaultFormat,

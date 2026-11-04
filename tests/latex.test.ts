@@ -62,3 +62,38 @@ describe('math in HTML export', () => {
             .toBe('<p>Also \\[E = mc^2\\] here.</p>')
     })
 })
+
+describe('code regions', () => {
+    const regex = String.raw`const re = /\[(.+?)\]\((.+?)\)/g`
+
+    it('keeps a fence that sits inside a longer fence', () => {
+        const input = `\`\`\`\`markdown\n# Template\n\n\`\`\`js\n${regex}\n\`\`\`\n\`\`\`\`\n\nAfter \\(x\\).`
+        expect(protectMath(input).text).toBe(`\`\`\`\`markdown\n# Template\n\n\`\`\`js\n${regex}\n\`\`\`\n\`\`\`\`\n\nAfter ╬0╬.`)
+    })
+
+    it('keeps tilde fences, fences in a quote and fences that never close', () => {
+        expect(protectMath(`~~~\n${regex}\n~~~`).text).toBe(`~~~\n${regex}\n~~~`)
+        expect(protectMath(`> \`\`\`\n> ${regex}\n> \`\`\``).text).toBe(`> \`\`\`\n> ${regex}\n> \`\`\``)
+        expect(protectMath(`\`\`\`js\n${regex}\n\nstill code \\(x\\)`).text).toBe(`\`\`\`js\n${regex}\n\nstill code \\(x\\)`)
+    })
+
+    it('keeps inline code that is written with several backticks', () => {
+        expect(protectMath('Use ``a \\(b\\) ` c`` and \\(d\\).').text).toBe('Use ``a \\(b\\) ` c`` and ╬0╬.')
+    })
+
+    it('reads math before and after a code block', () => {
+        expect(protectMath('\\(a\\)\n\n```\n\\(b\\)\n```\n\n\\(c\\)').text).toBe('╬0╬\n\n```\n\\(b\\)\n```\n\n╬1╬')
+    })
+})
+
+describe('dollar signs', () => {
+    it('does not take prices for math', () => {
+        for (const input of ['Costs $5 to $10 today.', 'Between $5 and $10, or $ 20.', 'Costs $5, then $ 7 more.']) {
+            expect(protectMath(input).text).toBe(input)
+        }
+    })
+
+    it('still reads $x$ as math', () => {
+        expect(protectMath('So $x$ and $a + b$ hold.').text).toBe('So ╬0╬ and ╬1╬ hold.')
+    })
+})

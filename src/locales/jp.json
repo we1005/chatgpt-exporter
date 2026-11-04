@@ -1,5 +1,5 @@
 {
-  "title": "ChatGPTエクスポーター",
+  "title": "Super ChatGPT Exporter",
   "ExportHelper": "エクスポート",
   "Setting": "設定",
   "Language": "言語",
@@ -69,5 +69,9 @@
   "Export Skipped Message": "{{n}} 件の会話は再試行しても失敗したため、エクスポートに含まれていません：",
   "List Rate Limited Wait": "リクエストが多すぎます · {{n}} 秒後に再試行してください",
   "List Rate Limited": "リクエストが多すぎます · しばらくしてから再試行してください",
-  "List Load Failed": "会話を読み込めませんでした"
+  "List Load Failed": "会話を読み込めませんでした",
+  "Thought for {{seconds}} seconds": "{{seconds}} 秒間思考しました",
+  "Thinking": "思考中",
+  "Download answer": "この回答をダウンロード",
+  "The answer could not be found": "回答が見つかりませんでした"
 }

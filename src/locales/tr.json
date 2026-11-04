@@ -1,5 +1,5 @@
 {
-  "title": "ChatGPT Exporter",
+  "title": "Super ChatGPT Exporter",
   "ExportHelper": "Dışa Aktar",
   "Setting": "Ayarlar",
   "Language": "Dil",
@@ -69,5 +69,9 @@
   "Export Skipped Message": "{{n}} konuşma tekrar denemelere rağmen başarısız oldu ve dışa aktarımda yer almıyor:",
   "List Rate Limited Wait": "API istek sınırına ulaşıldı · {{n}} sn bekleyip tekrar deneyin",
   "List Rate Limited": "API istek sınırına ulaşıldı · biraz sonra tekrar deneyin",
-  "List Load Failed": "Sohbetler yüklenemedi"
+  "List Load Failed": "Sohbetler yüklenemedi",
+  "Thought for {{seconds}} seconds": "{{seconds}} saniye düşündü",
+  "Thinking": "Düşünüyor",
+  "Download answer": "Bu yanıtı indir",
+  "The answer could not be found": "Yanıt bulunamadı"
 }

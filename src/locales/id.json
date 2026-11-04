@@ -1,5 +1,5 @@
 {
-  "title": "ChatGPT Exporter",
+  "title": "Super ChatGPT Exporter",
   "ExportHelper": "Ekspor",
   "Setting": "Pengaturan",
   "Language": "Bahasa",
@@ -69,5 +69,9 @@
   "Export Skipped Message": "{{n}} percakapan gagal setelah beberapa kali dicoba ulang dan tidak ada dalam ekspor:",
   "List Rate Limited Wait": "Dibatasi oleh API · tunggu {{n}} dtk lalu coba lagi",
   "List Rate Limited": "Dibatasi oleh API · coba lagi sebentar lagi",
-  "List Load Failed": "Gagal memuat percakapan"
+  "List Load Failed": "Gagal memuat percakapan",
+  "Thought for {{seconds}} seconds": "Berpikir selama {{seconds}} detik",
+  "Thinking": "Berpikir",
+  "Download answer": "Unduh jawaban ini",
+  "The answer could not be found": "Jawaban tidak ditemukan"
 }

@@ -1,5 +1,5 @@
 {
-  "title": "ChatGPT Exporter",
+  "title": "Super ChatGPT Exporter",
   "ExportHelper": "Exportar",
   "Setting": "Ajustes",
   "Language": "Idioma",
@@ -69,5 +69,9 @@
   "Export Skipped Message": "{{n}} conversaciones fallaron tras varios reintentos y no están en la exportación:",
   "List Rate Limited Wait": "Límite de solicitudes de la API · espera {{n}} s y vuelve a intentarlo",
   "List Rate Limited": "Límite de solicitudes de la API · vuelve a intentarlo en un momento",
-  "List Load Failed": "No se pudieron cargar las conversaciones"
+  "List Load Failed": "No se pudieron cargar las conversaciones",
+  "Thought for {{seconds}} seconds": "Pensó durante {{seconds}} segundos",
+  "Thinking": "Pensando",
+  "Download answer": "Descargar esta respuesta",
+  "The answer could not be found": "No se encontró la respuesta"
 }

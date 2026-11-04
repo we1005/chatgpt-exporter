@@ -108,7 +108,7 @@ describe('exportAllToHtml', () => {
 describe('exportAllToMarkdown', () => {
     it('lists uploaded files after the message', async () => {
         const markdown = await exportFile(exportAllToMarkdown, uploadConversation)
-        expect(markdown).toContain('Is this good?\n\n- 📎 notes <v2>.html\n\n#### ChatGPT:')
+        expect(markdown).toContain('Is this good?\n\n- 📎 notes <v2>.html\n\n## ChatGPT:')
         expect(markdown).not.toContain('photo.png')
         expect(markdown).not.toContain('FILE CONTENT')
     })
@@ -117,7 +117,7 @@ describe('exportAllToMarkdown', () => {
         const markdown = await exportFile(exportAllToMarkdown, conversation([
             { role: 'assistant', content: { content_type: 'code', text: 'print(1)' } },
         ]))
-        expect(markdown).toContain('#### ChatGPT:\nCode:\n\n```\nprint(1)\n```')
+        expect(markdown).toContain('## ChatGPT:\nCode:\n\n```\nprint(1)\n```')
     })
 })
 
